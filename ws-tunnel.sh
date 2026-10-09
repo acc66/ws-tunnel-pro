@@ -75,14 +75,13 @@ download_bin() {
         aarch64|arm64) arch="arm64" ;;
         *) red "不支持的架构: $(uname -m)"; exit 1 ;;
     esac
-    # 本地已有同目录二进制时优先使用（离线安装），但必须是支持拉黑参数的新版
+    # 本地已有同目录二进制时优先使用（离线安装），但必须是支持多路复用的新版
     local here; here="$(cd "$(dirname "$0")" && pwd)/ws-tunnel-server-tcp-linux-${arch}"
     if [ -f "$here" ]; then
-        chmod +x "$here"
-        if "$here" -h 2>&1 | grep -q -- "-blacklist"; then
+        if grep -q "X-Tunnel-Mux" "$here"; then
             install -m 755 "$here" "$BIN"; green "已安装本地文件 $here → $BIN"; return
         fi
-        yellow "本地文件 $here 是旧版（不支持 -blacklist），改为从 GitHub 下载新版"
+        yellow "本地文件 $here 是旧版（不支持多路复用），改为从 GitHub 下载新版"
     fi
     local url="https://github.com/${REPO}/releases/latest/download/ws-tunnel-server-tcp-linux-${arch}"
     yellow "下载 $url"

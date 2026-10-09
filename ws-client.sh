@@ -4,7 +4,8 @@
 # 每个本地端口一个独立服务实例: ws-client@端口
 # 用法: bash ws-client.sh                    # 交互菜单
 #       bash ws-client.sh install            # 安装程序
-#       bash ws-client.sh add 端口 ws://B:8080/mm 密码 [监听IP]
+#       bash ws-client.sh add 端口 ws://B:8080/mm[,ws://备用B:8080/mm] 密码 [监听IP]
+#       bash ws-client.sh server 端口 ws://B1:8080/mm,ws://B2:8080/mm   # 修改服务器/备用服务器
 #       bash ws-client.sh del 端口 | list | log [端口] | restart [端口]
 #                         stop [端口] | start [端口] | enable 端口 | disable 端口
 #                         update | uninstall
@@ -22,6 +23,15 @@ yellow(){ echo -e "\033[33m$*\033[0m"; }
 [ "$(id -u)" -ne 0 ] && { red "请用 root 运行"; exit 1; }
 
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+# 校验服务器地址列表（逗号分隔，第一个为主，其余为备用）
+valid_servers() {
+    [ -z "$1" ] && { red "服务器地址不能为空"; return 1; }
+    local x
+    for x in ${1//,/ }; do
+        [[ "$x" =~ ^wss?://[^[:space:]\"\']+$ ]] || { red "地址无效: $x（必须以 ws:// 或 wss:// 开头）"; return 1; }
+    done
+}
 ports() { ls "$CONF_DIR"/*.conf 2>/dev/null | sed 's#.*/##; s#\.conf$##' | sort -n; }
 
 write_unit() {
@@ -55,7 +65,10 @@ download_bin() {
     esac
     local here; here="$(cd "$(dirname "$0")" && pwd)/ws-tunnel-client-linux-${arch}"
     if [ -f "$here" ]; then
-        install -m 755 "$here" "$BIN"; green "已安装本地文件 $here → $BIN"; return
+        if grep -q "X-Tunnel-Mux" "$here"; then
+            install -m 755 "$here" "$BIN"; green "已安装本地文件 $here → $BIN"; return
+        fi
+        yellow "本地文件 $here 是旧版（不支持多路复用/备用服务器），改为从 GitHub 下载新版"
     fi
     command -v curl >/dev/null || { apt-get install -y curl 2>/dev/null || yum install -y curl; }
     local url="https://github.com/${REPO}/releases/latest/download/ws-tunnel-client-linux-${arch}"
@@ -94,8 +107,8 @@ do_add() {
     if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p\$"; then
         red "端口 $p 已被其他程序占用"; return 1
     fi
-    [ -z "$s" ]  && read -rp "B 服务器地址 (如 ws://1.2.3.4:8080/mm): " s
-    [[ "$s" =~ ^wss?:// ]] || { red "地址必须以 ws:// 或 wss:// 开头"; return 1; }
+    [ -z "$s" ]  && read -rp "B 服务器地址，多个用逗号分隔，第一个为主其余为备用 (如 ws://1.2.3.4:8080/mm,ws://5.6.7.8:8080/mm): " s
+    valid_servers "$s" || return 1
     [ -z "$pw" ] && read -rp "连接密码: " pw
     [ -z "$pw" ] && { red "密码不能为空"; return 1; }
     [ -z "$4" ] && { read -rp "监听IP [0.0.0.0]: " bb; [ -n "$bb" ] && b="$bb"; }
@@ -124,6 +137,22 @@ do_del() {
     systemctl disable --now "ws-client@$p" >/dev/null 2>&1
     rm -f "$CONF_DIR/$p.conf"
     green "已删除端口 $p"
+}
+
+# 修改某端口的服务器地址（含备用服务器）
+do_server() {
+    local p="$1" s="$2"
+    [ -z "$p" ] && { do_list; read -rp "端口: " p; }
+    [ -f "$CONF_DIR/$p.conf" ] || { red "端口 $p 不存在"; return 1; }
+    if [ -z "$s" ]; then
+        ( . "$CONF_DIR/$p.conf"; echo "当前: $SERVER" )
+        read -rp "新地址，多个用逗号分隔（第一个为主，其余为备用）: " s
+    fi
+    valid_servers "$s" || return 1
+    local tmp="$CONF_DIR/$p.conf.tmp.$$"
+    awk -v s="$s" '/^SERVER=/{print "SERVER=\"" s "\""; next} {print}' "$CONF_DIR/$p.conf" > "$tmp" \
+        && chmod 600 "$tmp" && mv -f "$tmp" "$CONF_DIR/$p.conf"
+    systemctl restart "ws-client@$p" && green "端口 $p → $s"
 }
 
 do_list() {
@@ -177,6 +206,7 @@ menu() {
         echo " 5. 重启                 6. 停止"
         echo " 7. 启动                 8. 开机启动 开"
         echo " 9. 开机启动 关         10. 卸载"
+        echo "11. 修改服务器地址 / 备用服务器"
         echo " 0. 退出"
         read -rp "选择: " n
         case "$n" in
@@ -187,13 +217,13 @@ menu() {
             7) read -rp "端口(留空=全部): " p; each start "$p" ;;
             8) read -rp "端口(留空=全部): " p; each enable "$p" ;;
             9) read -rp "端口(留空=全部): " p; each disable "$p" ;;
-            10) do_uninstall ;; 0) exit 0 ;;
+            10) do_uninstall ;; 11) do_server ;; 0) exit 0 ;;
         esac
     done
 }
 
 case "$1" in
-    install) do_install ;; add) do_add "$2" "$3" "$4" "$5" ;; del) do_del "$2" ;;
+    install) do_install ;; add) do_add "$2" "$3" "$4" "$5" ;; del) do_del "$2" ;; server) do_server "$2" "$3" ;;
     list) do_list ;; log) do_log "$2" ;;
     restart|stop|start|enable|disable) each "$1" "$2" ;;
     update) do_update ;; uninstall) do_uninstall ;; *) menu ;;

@@ -41,6 +41,17 @@ curl -fLO https://raw.githubusercontent.com/acc66/ws-tunnel-pro/main/ws-client.s
 bash ws-client.sh add 1080 ws://B_IP:8080/mm 你的密码
 ```
 
+有备用 B 服务器时，地址用逗号分隔，第一个是主服务器，后面的是备用：
+
+```bash
+bash ws-client.sh add 1080 ws://B_IP:8080/mm,ws://备用B_IP:8080/mm 你的密码
+bash ws-client.sh server 1080 ws://B_IP:8080/mm,ws://备用B_IP:8080/mm   # 已有端口修改服务器
+```
+
+- 主服务器连不上（5 秒超时）就自动切到下一个，新连接不会失败。
+- 故障服务器每 10 秒探测一次，主服务器恢复后新连接自动切回主服务器。
+- 所有服务器的密码要一致。
+
 每个端口是一个独立的 systemd 服务 `ws-client@端口`，添加后自动启动并开机自启。需要多个入口端口就多执行几次 `add`：
 
 ```bash
@@ -48,15 +59,23 @@ bash ws-client.sh add 1081 ws://B_IP:8443/mm 你的密码
 bash ws-client.sh list
 ```
 
+### 多路复用（减少 TCP 连接数）
+
+A 默认把所有用户连接复用到每个 B 服务器的 4 条 WebSocket 长连接上（smux），A→B 之间只有 4 条 TCP 连接，不再是一个用户连接一条。好处是 B 的连接数、握手开销和内存都大幅下降，新连接也不用再等 TCP + WebSocket 握手。
+
+- A 和 B 都要更新到新版才会启用；任意一端是旧版时自动退回原来的单连接模式，不影响使用。
+- 调整复用条数：编辑 `/etc/ws-client/端口.conf`，例如 `EXTRA="-mux 8"`；`-mux 0` 关闭复用。
+- 其他参数：`-timeout 5s`（连接超时，超时即切备用）、`-check 10s`（故障服务器探测间隔）、`-v`（输出每个连接的日志，默认关闭以减少日志量）。
+
 ## 3. 验证
 
 ```bash
 # A 服务器上
 bash ws-client.sh list          # 状态应为 active
-bash ws-client.sh log 1080      # 有连接时会出现 “已连接服务器”
+bash ws-client.sh log 1080      # 启动时列出主/备用服务器，之后每分钟输出活动连接数；服务器故障/恢复时会提示
 
 # B 服务器上
-bash ws-tunnel.sh log           # 有连接时会出现 “新连接 … → 目标地址”
+bash ws-tunnel.sh log           # 每分钟输出 WebSocket 连接数和转发中的连接数（加 -v 可看每个连接）
 ```
 
 注意：不要用浏览器或 `curl http://B_IP:8080/` 去测 B，路径不是 `/mm` 会把你自己拉黑。要测伪装页的话，先把自己的 IP 加进白名单。
@@ -126,7 +145,8 @@ bash ws-tunnel.sh uninstall       # 卸载（保留配置和拉黑文件）
 
 ```bash
 bash ws-client.sh                 # 交互菜单
-bash ws-client.sh add 端口 ws://B_IP:8080/mm 密码 [监听IP，默认 0.0.0.0]
+bash ws-client.sh add 端口 ws://B_IP:8080/mm[,ws://备用B:8080/mm] 密码 [监听IP，默认 0.0.0.0]
+bash ws-client.sh server 1080 ws://B1:8080/mm,ws://B2:8080/mm   # 修改服务器 / 备用服务器
 bash ws-client.sh del 1080        # 删除端口
 bash ws-client.sh list            # 查看所有端口
 bash ws-client.sh log [端口]      # 实时日志，不带端口则显示全部

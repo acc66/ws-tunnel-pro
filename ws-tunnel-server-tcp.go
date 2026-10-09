@@ -10,6 +10,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/subtle"
 	"errors"
 	"flag"
 	"fmt"
@@ -22,9 +23,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/xtaci/smux"
 )
 
 var (
@@ -41,6 +44,7 @@ var (
 	syncEvery = flag.Duration("sync", 60*time.Second, "从 Redis 同步黑名单间隔")
 	allowList = flag.String("allow", "", "永不拉黑的IP，逗号分隔（自己的测试IP等）")
 	noBan     = flag.Bool("no-ban", false, "关闭拉黑（仅返回蜜罐页）")
+	verbose   = flag.Bool("v", false, "输出每个连接的日志（连接数大时建议关闭）")
 )
 
 const (
@@ -52,12 +56,33 @@ const (
 	honeypotHTML = `<!DOCTYPE html><html><head><title>Welcome to nginx!</title><style>body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p><p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.</p><p><em>Thank you for using nginx.</em></p></body></html>`
 )
 
+const (
+	muxHeader    = "X-Tunnel-Mux"
+	muxVersion   = "smux2"
+	pingInterval = 30 * time.Second
+	idleTimeout  = 90 * time.Second // 超过这个时间收不到任何数据/心跳即断开，回收死连接
+)
+
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  65536,
-	WriteBufferSize: 65536,
+	ReadBufferSize:  16 * 1024,
+	WriteBufferSize: 16 * 1024,
+	WriteBufferPool: &sync.Pool{},
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
+}
+
+var (
+	bufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
+
+	wsCount     int64 // 当前 WebSocket 连接数
+	streamCount int64 // 当前转发中的目标连接数
+)
+
+func vlog(format string, v ...any) {
+	if *verbose {
+		log.Printf(format, v...)
+	}
 }
 
 var bl *blacklist
@@ -425,6 +450,8 @@ func main() {
 		log.Printf("🛡️  拉黑文件: %s", *blFile)
 	}
 
+	go statsLoop()
+
 	errCh := make(chan error, 1)
 	for _, a := range strings.Split(*listenAddr, ",") {
 		a = strings.TrimSpace(a)
@@ -436,7 +463,7 @@ func main() {
 			log.Fatalf("监听 %s 失败: %v", a, err)
 		}
 		log.Printf("📍 监听地址: %s", a)
-		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 		go func() { errCh <- srv.Serve(filterListener{ln}) }()
 	}
 	log.Fatal("启动失败:", <-errCh)
@@ -448,80 +475,185 @@ func handleWebSocketTunnel(w http.ResponseWriter, r *http.Request) {
 		handleFakePage(w, r)
 		return
 	}
-	// 验证密码：错误只给蜜罐，不拉黑（避免误封自己）
+	// 验证密码：错误只给蜜罐，不拉黑（避免误封自己）；常量时间比较防止计时侧信道
 	authHeader := r.Header.Get("Authorization")
-	if authHeader != "Bearer "+*password || !websocket.IsWebSocketUpgrade(r) {
+	if subtle.ConstantTimeCompare([]byte(authHeader), []byte("Bearer "+*password)) != 1 || !websocket.IsWebSocketUpgrade(r) {
 		log.Printf("❌ 未授权访问: %s", r.RemoteAddr)
 		writeFakePage(w)
 		return
 	}
 
-	// 升级为 WebSocket
-	wsConn, err := upgrader.Upgrade(w, r, nil)
+	// 客户端请求多路复用时在响应头里确认；旧版客户端不带这个头，走单连接模式
+	useMux := r.Header.Get(muxHeader) == muxVersion
+	var respHeader http.Header
+	if useMux {
+		respHeader = http.Header{muxHeader: []string{muxVersion}}
+	}
+
+	wsConn, err := upgrader.Upgrade(w, r, respHeader)
 	if err != nil {
 		log.Printf("❌ WebSocket 升级失败: %v", err)
 		return
 	}
-	defer wsConn.Close()
+	conn := newWSConn(wsConn)
+	defer conn.Close()
+	atomic.AddInt64(&wsCount, 1)
+	defer atomic.AddInt64(&wsCount, -1)
 
-	log.Printf("✅ 新连接: %s → %s", r.RemoteAddr, *targetAddr)
+	if !useMux {
+		vlog("✅ 新连接: %s → %s", r.RemoteAddr, *targetAddr)
+		forward(conn)
+		vlog("🔌 连接关闭: %s", r.RemoteAddr)
+		return
+	}
 
-	// 直接 TCP 连接到目标（不做 WebSocket 握手）
+	sess, err := smux.Server(conn, smuxConfig())
+	if err != nil {
+		log.Printf("❌ 创建复用会话失败: %v", err)
+		return
+	}
+	defer sess.Close()
+	vlog("✅ 新复用连接: %s", r.RemoteAddr)
+	for {
+		st, err := sess.AcceptStream()
+		if err != nil {
+			break
+		}
+		go func() {
+			defer st.Close()
+			forward(st)
+		}()
+	}
+	vlog("🔌 复用连接关闭: %s", r.RemoteAddr)
+}
+
+// forward 连接目标并双向转发，任意一端结束即关闭两端
+func forward(c io.ReadWriteCloser) {
+	atomic.AddInt64(&streamCount, 1)
+	defer atomic.AddInt64(&streamCount, -1)
+
 	tcpConn, err := net.DialTimeout("tcp", *targetAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("❌ 连接目标失败 %s: %v", *targetAddr, err)
 		return
 	}
-	defer tcpConn.Close()
+	if tc, ok := tcpConn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
 
-	log.Printf("🔗 已连接目标: %s", *targetAddr)
+	done := make(chan struct{}, 2)
+	cp := func(dst, src io.ReadWriteCloser) {
+		bp := bufPool.Get().(*[]byte)
+		_, err := io.CopyBuffer(dst, src, *bp)
+		bufPool.Put(bp)
+		if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+			vlog("⚠️  转发结束: %v", err)
+		}
+		dst.Close()
+		src.Close()
+		done <- struct{}{}
+	}
+	go cp(tcpConn, c)
+	go cp(c, tcpConn)
+	<-done
+	<-done
+}
 
-	// 双向转发（WebSocket ↔ TCP）
-	var wg sync.WaitGroup
-	wg.Add(2)
+func smuxConfig() *smux.Config {
+	c := smux.DefaultConfig()
+	c.Version = 2
+	c.KeepAliveInterval = 10 * time.Second
+	c.KeepAliveTimeout = 30 * time.Second
+	c.MaxReceiveBuffer = 16 * 1024 * 1024
+	c.MaxStreamBuffer = 1024 * 1024
+	return c
+}
 
-	// WebSocket → TCP
+func statsLoop() {
+	var lw, ls int64 = -1, -1
+	for {
+		time.Sleep(60 * time.Second)
+		w, s := atomic.LoadInt64(&wsCount), atomic.LoadInt64(&streamCount)
+		if w != lw || s != ls {
+			log.Printf("📊 WebSocket 连接: %d，转发中: %d", w, s)
+			lw, ls = w, s
+		}
+	}
+}
+
+// ==================== WebSocket → io.ReadWriteCloser ====================
+
+// wsConn 把 WebSocket 包装成字节流：每次 Write 一个二进制消息，Read 流式读取消息体（不整条分配内存）
+// 带 ping/pong 心跳和读超时，对端掉线（断电、NAT 超时）时能及时回收连接
+type wsConn struct {
+	ws   *websocket.Conn
+	r    io.Reader
+	wm   sync.Mutex
+	once sync.Once
+	stop chan struct{}
+}
+
+func newWSConn(ws *websocket.Conn) *wsConn {
+	c := &wsConn{ws: ws, stop: make(chan struct{})}
+	ws.SetReadDeadline(time.Now().Add(idleTimeout))
+	ws.SetPongHandler(func(string) error { return ws.SetReadDeadline(time.Now().Add(idleTimeout)) })
 	go func() {
-		defer wg.Done()
-		defer tcpConn.Close()
-
+		t := time.NewTicker(pingInterval)
+		defer t.Stop()
 		for {
-			msgType, data, err := wsConn.ReadMessage()
-			if err != nil {
+			select {
+			case <-c.stop:
 				return
-			}
-
-			if msgType == websocket.BinaryMessage {
-				if _, err := tcpConn.Write(data); err != nil {
+			case <-t.C:
+				if ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)) != nil {
+					c.Close()
 					return
 				}
 			}
 		}
 	}()
+	return c
+}
 
-	// TCP → WebSocket
-	go func() {
-		defer wg.Done()
-		defer wsConn.Close()
-
-		buf := make([]byte, 32768)
-		for {
-			n, err := tcpConn.Read(buf)
+func (c *wsConn) Read(p []byte) (int, error) {
+	for {
+		if c.r == nil {
+			t, r, err := c.ws.NextReader()
 			if err != nil {
-				if err != io.EOF && !errors.Is(err, net.ErrClosed) {
-					log.Printf("⚠️  读取目标失败: %v", err)
-				}
-				return
+				return 0, err
 			}
-
-			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				return
+			c.ws.SetReadDeadline(time.Now().Add(idleTimeout))
+			if t != websocket.BinaryMessage {
+				continue
 			}
+			c.r = r
 		}
-	}()
+		n, err := c.r.Read(p)
+		if err == io.EOF {
+			c.r = nil
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+		return n, err
+	}
+}
 
-	wg.Wait()
-	log.Printf("🔌 连接关闭: %s", r.RemoteAddr)
+func (c *wsConn) Write(p []byte) (int, error) {
+	c.wm.Lock()
+	defer c.wm.Unlock()
+	c.ws.SetWriteDeadline(time.Now().Add(idleTimeout))
+	if err := c.ws.WriteMessage(websocket.BinaryMessage, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (c *wsConn) Close() error {
+	c.once.Do(func() { close(c.stop) })
+	return c.ws.Close()
 }
 
 func handleFakePage(w http.ResponseWriter, r *http.Request) {
