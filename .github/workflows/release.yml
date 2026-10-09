@@ -1,0 +1,50 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build
+        run: |
+          mkdir -p releases
+          LDFLAGS="-s -w"
+          for arch in amd64 arm64 386; do
+            GOOS=linux GOARCH=$arch go build -ldflags="$LDFLAGS" -o releases/ws-tunnel-server-tcp-linux-$arch ws-tunnel-server-tcp.go
+            GOOS=linux GOARCH=$arch go build -ldflags="$LDFLAGS" -o releases/ws-tunnel-client-linux-$arch ws-tunnel-client.go
+          done
+          GOOS=windows GOARCH=amd64 go build -ldflags="$LDFLAGS" -o releases/ws-tunnel-server-tcp-windows-amd64.exe ws-tunnel-server-tcp.go
+          GOOS=windows GOARCH=amd64 go build -ldflags="$LDFLAGS" -o releases/ws-tunnel-client-windows-amd64.exe ws-tunnel-client.go
+          cp ws-tunnel.sh ws-client.sh README.md LICENSE releases/
+          cd releases && sha256sum ws-tunnel-* > SHA256SUMS
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: releases/*
+          body: |
+            ## ws-tunnel ${{ github.ref_name }}
+
+            ```bash
+            # B 服务器
+            curl -fLO https://github.com/${{ github.repository }}/releases/latest/download/ws-tunnel.sh && bash ws-tunnel.sh install
+            # A 服务器
+            curl -fLO https://github.com/${{ github.repository }}/releases/latest/download/ws-client.sh && bash ws-client.sh add 1080 ws://B_IP:8080/mm 你的密码
+            ```
+
+            使用说明见 [README](https://github.com/${{ github.repository }}#readme)

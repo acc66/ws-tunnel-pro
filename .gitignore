@@ -1,0 +1,8 @@
+*.exe
+releases/
+dist/
+.vscode/
+.idea/
+*.log
+*.env
+!*.env.example
