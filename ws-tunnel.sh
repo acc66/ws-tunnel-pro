@@ -7,18 +7,30 @@
 #                         bans | unban IP | ban IP | clearbans | allow IP列表 | redis
 #                         restart | stop | status | enable | disable | update | uninstall | version
 #                         shortcut [名字]   # 快捷命令，默认 wst
+#                         name 进程名      # 自定义进程名（- 恢复默认）
 #================================================================
 
-SCRIPT_VER="v1.3.0"
+SCRIPT_VER="v1.4.0"
 REPO="acc66/ws-tunnel-pro"
 SCRIPT_NAME="ws-tunnel.sh"
 SHORT_DEFAULT="wst"
-BIN="/usr/local/bin/ws-tunnel-server-tcp"
 CONF_DIR="/etc/ws-tunnel"
 CONF="$CONF_DIR/ws-tunnel.conf"
-SERVICE="ws-tunnel"
-UNIT="/etc/systemd/system/${SERVICE}.service"
 BLFILE="$CONF_DIR/blacklist.txt"
+
+NAME_FILE="$CONF_DIR/name"   # 自定义进程名（ps/top/systemctl 中显示的名字）
+
+# 读取进程名: 未设置用默认名；设置后程序文件名和 systemd 服务名都用它
+load_name() {
+    PNAME=""; [ -s "$NAME_FILE" ] && PNAME="$(head -n1 "$NAME_FILE")"
+    BIN="/usr/local/bin/${PNAME:-ws-tunnel-server-tcp}"
+    SERVICE="${PNAME:-ws-tunnel}"
+    UNIT="/etc/systemd/system/${SERVICE}.service"
+}
+load_name
+
+# 进程名限制: 字母数字._- ，最长 15（Linux 进程名 comm 上限）
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$ ]]; }
 
 red()   { echo -e "\033[31m$*\033[0m"; }
 green() { echo -e "\033[32m$*\033[0m"; }
@@ -240,6 +252,7 @@ do_install() {
     read -rp "同时启用共享 Redis 黑名单（多节点共用）？(y/N) [${REDIS_HOST:+当前 $REDIS_HOST}]: " y
     [ "$y" = "y" ] && ask_redis
 
+    do_name
     download_bin
     save_conf
     write_unit
@@ -257,6 +270,7 @@ do_ports() {
     echo "WS 路径:  $WSPATH"
     echo "转发到:   $TARGET"
     echo "拉黑文件: $BLFILE（$(bl_count) 个IP）   共享Redis: ${REDIS_HOST:-未启用}"
+    echo "进程名:   $SERVICE（$BIN）"
     echo "开机启动: $(systemctl is-enabled "$SERVICE" 2>/dev/null || echo 未安装)   运行状态: $(systemctl is-active "$SERVICE" 2>/dev/null)"
 }
 
@@ -384,6 +398,35 @@ do_uninstall() {
     green "已卸载（保留配置目录 $CONF_DIR，含拉黑文件）"
 }
 
+# 修改进程名: 停旧服务 → 改程序文件名 → 重写 systemd 服务 → 按原状态启动
+do_name() {
+    local n="$1"
+    [ -z "$n" ] && read -rp "新进程名(字母数字._-，最长15，输入 - 恢复默认) [当前 $SERVICE]: " n
+    [ -z "$n" ] && return
+    if [ "$n" = "-" ]; then n=""; else valid_name "$n" || { red "进程名无效: $n"; return 1; }; fi
+    local old_bin="$BIN" old_svc="$SERVICE" old_unit="$UNIT"
+    local new_bin="/usr/local/bin/${n:-ws-tunnel-server-tcp}" new_unit="/etc/systemd/system/${n:-ws-tunnel}.service"
+    [ "$new_unit" = "$old_unit" ] && { yellow "进程名未变化: $SERVICE"; return 0; }
+    # 不覆盖其他程序或服务
+    [ -e "$new_bin" ] && [ "$new_bin" != "$old_bin" ] && { red "$new_bin 已存在，换个名字"; return 1; }
+    [ -e "$new_unit" ] && { red "$new_unit 已存在，换个名字"; return 1; }
+    if [ -n "$n" ] && { systemctl cat "$n.service" >/dev/null 2>&1 || command -v "$n" >/dev/null; }; then
+        red "系统已有同名服务或命令: $n，换个名字"; return 1
+    fi
+    local en act; en=$(systemctl is-enabled "$old_svc" 2>/dev/null); act=$(systemctl is-active "$old_svc" 2>/dev/null)
+    [ -f "$old_unit" ] && systemctl disable --now "$old_svc" >/dev/null 2>&1
+    mkdir -p "$CONF_DIR"
+    if [ -n "$n" ]; then echo "$n" > "$NAME_FILE"; else rm -f "$NAME_FILE"; fi
+    load_name
+    [ -f "$old_bin" ] && mv -f "$old_bin" "$BIN"
+    if [ -f "$old_unit" ]; then
+        rm -f "$old_unit"; write_unit
+        [ "$en" = "enabled" ] && systemctl enable "$SERVICE" >/dev/null 2>&1
+        [ "$act" = "active" ] && systemctl start "$SERVICE"
+    fi
+    green "进程名已改为 $SERVICE（程序 $BIN，服务 $SERVICE）"
+}
+
 menu() {
     while true; do
         echo
@@ -400,6 +443,7 @@ menu() {
         echo "17. 开机启动 开         18. 开机启动 关"
         echo "19. 更新程序            20. 卸载"
         echo "21. 查看版本            22. 设置快捷命令（当前: $(short_name)）"
+        echo "23. 修改进程名（当前: $SERVICE）"
         echo " 0. 退出"
         read -rp "选择: " n
         case "$n" in
@@ -407,7 +451,7 @@ menu() {
             5) do_passwd ;; 6) do_allow ;; 7) do_log ;; 8) do_banlog ;;
             9) do_bans ;; 10) do_unban ;; 11) do_ban ;; 12) do_clearbans ;;
             13) do_redis ;; 14) do_restart ;; 15) do_stop ;; 16) do_status ;;
-            17) do_enable ;; 18) do_disable ;; 19) do_update ;; 20) do_uninstall ;; 21) do_version ;; 22) set_shortcut ;;
+            17) do_enable ;; 18) do_disable ;; 19) do_update ;; 20) do_uninstall ;; 21) do_version ;; 22) set_shortcut ;; 23) do_name ;;
             0) exit 0 ;;
         esac
     done
@@ -420,6 +464,6 @@ case "$1" in
     clearbans) do_clearbans ;; redis) do_redis ;;
     restart) do_restart ;; stop) do_stop ;; status) do_status ;;
     enable) do_enable ;; disable) do_disable ;;
-    update) do_update ;; uninstall) do_uninstall ;; version|-v|--version) do_version ;; shortcut) set_shortcut "$2" ;;
+    update) do_update ;; uninstall) do_uninstall ;; version|-v|--version) do_version ;; shortcut) set_shortcut "$2" ;; name) do_name "$2" ;;
     *) ensure_shortcut; menu ;;
 esac

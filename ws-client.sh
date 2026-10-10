@@ -1,7 +1,7 @@
 #!/bin/bash
 #================================================================
 # ws-tunnel-client 一键安装 / 管理脚本（A 服务器）
-# 每个本地端口一个独立服务实例: ws-client@端口
+# 每个本地端口一个独立服务实例: ws-client@端口（进程名可自定义: name 命令）
 # 用法: bash ws-client.sh                    # 交互菜单
 #       bash ws-client.sh install            # 安装程序
 #       bash ws-client.sh add 端口 ws://B:8080/mm[,ws://备用B:8080/mm] 密码 [监听IP]
@@ -9,15 +9,28 @@
 #       bash ws-client.sh del 端口 | list | log [端口] | restart [端口]
 #                         stop [端口] | start [端口] | enable 端口 | disable 端口
 #                         update | uninstall | version | shortcut [名字]   # 快捷命令，默认 wsc
+#                         name 进程名   # 自定义进程名（- 恢复默认）
 #================================================================
 
-SCRIPT_VER="v1.3.0"
+SCRIPT_VER="v1.4.0"
 REPO="acc66/ws-tunnel-pro"
 SCRIPT_NAME="ws-client.sh"
 SHORT_DEFAULT="wsc"
-BIN="/usr/local/bin/ws-tunnel-client"
 CONF_DIR="/etc/ws-client"
-UNIT="/etc/systemd/system/ws-client@.service"
+
+NAME_FILE="$CONF_DIR/name"   # 自定义进程名（ps/top/systemctl 中显示的名字）
+
+# 读取进程名: 未设置用默认名；设置后程序文件名和 systemd 服务名都用它
+load_name() {
+    PNAME=""; [ -s "$NAME_FILE" ] && PNAME="$(head -n1 "$NAME_FILE")"
+    BIN="/usr/local/bin/${PNAME:-ws-tunnel-client}"
+    SERVICE="${PNAME:-ws-client}"
+    UNIT="/etc/systemd/system/${SERVICE}@.service"
+}
+load_name
+
+# 进程名限制: 字母数字._- ，最长 15（Linux 进程名 comm 上限）
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$ ]]; }
 
 red()   { echo -e "\033[31m$*\033[0m"; }
 green() { echo -e "\033[32m$*\033[0m"; }
@@ -177,6 +190,7 @@ open_firewall() {
 }
 
 do_install() {
+    [ -x "$BIN" ] || do_name   # 首次安装时可设置进程名
     download_bin
     mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
     write_unit
@@ -216,9 +230,9 @@ PASSWORD="$pw"
 EXTRA=""
 EOF
     chmod 600 "$CONF_DIR/$p.conf"
-    systemctl enable --now "ws-client@$p" >/dev/null 2>&1
+    systemctl enable --now "${SERVICE}@$p" >/dev/null 2>&1
     sleep 1
-    if systemctl is-active -q "ws-client@$p"; then
+    if systemctl is-active -q "${SERVICE}@$p"; then
         green "已添加 $b:$p → $s（已开机启动）"
         open_firewall "$p"
     else
@@ -229,7 +243,7 @@ EOF
 do_del() {
     local p="$1"; [ -z "$p" ] && { do_list; read -rp "要删除的端口: " p; }
     [ -f "$CONF_DIR/$p.conf" ] || { red "端口 $p 不存在"; return 1; }
-    systemctl disable --now "ws-client@$p" >/dev/null 2>&1
+    systemctl disable --now "${SERVICE}@$p" >/dev/null 2>&1
     rm -f "$CONF_DIR/$p.conf"
     green "已删除端口 $p"
 }
@@ -248,7 +262,7 @@ do_server() {
     local tmp="$CONF_DIR/$p.conf.tmp.$$"
     awk -v s="$s" '/^SERVER=/{print "SERVER=\"" s "\""; next} {print}' "$CONF_DIR/$p.conf" > "$tmp" \
         && chmod 600 "$tmp" && mv -f "$tmp" "$CONF_DIR/$p.conf"
-    systemctl restart "ws-client@$p" && green "端口 $p → $s"
+    systemctl restart "${SERVICE}@$p" && green "端口 $p → $s"
 }
 
 do_list() {
@@ -257,8 +271,8 @@ do_list() {
     printf "%-7s %-9s %-9s %s\n" "端口" "状态" "开机" "转发到"
     for p in $list; do
         ( . "$CONF_DIR/$p.conf"
-          printf "%-7s %-9s %-9s %s\n" "$p" "$(systemctl is-active "ws-client@$p")" \
-              "$(systemctl is-enabled "ws-client@$p" 2>/dev/null)" "$SERVER" )
+          printf "%-7s %-9s %-9s %s\n" "$p" "$(systemctl is-active "${SERVICE}@$p")" \
+              "$(systemctl is-enabled "${SERVICE}@$p" 2>/dev/null)" "$SERVER" )
     done
 }
 
@@ -267,18 +281,18 @@ each() {
     local act="$1" p="$2"
     if [ -n "$p" ]; then
         [ -f "$CONF_DIR/$p.conf" ] || { red "端口 $p 不存在"; return 1; }
-        systemctl "$act" "ws-client@$p" && green "$act $p 完成"
+        systemctl "$act" "${SERVICE}@$p" && green "$act $p 完成"
     else
-        for x in $(ports); do systemctl "$act" "ws-client@$x" && green "$act $x 完成"; done
+        for x in $(ports); do systemctl "$act" "${SERVICE}@$x" && green "$act $x 完成"; done
     fi
 }
 
 do_log() {
     local p="$1"
     if [ -n "$p" ]; then
-        journalctl -u "ws-client@$p" -n 100 -f --no-pager
+        journalctl -u "${SERVICE}@$p" -n 100 -f --no-pager
     else
-        journalctl -u "ws-client@*" -n 100 -f --no-pager
+        journalctl -u "${SERVICE}@*" -n 100 -f --no-pager
     fi
 }
 
@@ -286,10 +300,42 @@ do_update() { ensure_shortcut; update_script; download_bin; green "当前程序�
 
 do_uninstall() {
     read -rp "确认卸载 ws-client（停止所有端口）？(y/N): " y; [ "$y" != "y" ] && return
-    for p in $(ports); do systemctl disable --now "ws-client@$p" >/dev/null 2>&1; done
+    for p in $(ports); do systemctl disable --now "${SERVICE}@$p" >/dev/null 2>&1; done
     rm -f "$UNIT" "$BIN"; systemctl daemon-reload
     local n; n=$(short_name); [ -n "$n" ] && grep -q "$REPO" "/usr/local/bin/$n" 2>/dev/null && rm -f "/usr/local/bin/$n"; rm -f "$SHORT_FILE"
     green "已卸载（保留配置目录 $CONF_DIR）"
+}
+
+# 修改进程名: 停所有端口 → 改程序文件名 → 重写 systemd 模板 → 按原状态启动
+do_name() {
+    local n="$1"
+    [ -z "$n" ] && read -rp "新进程名(字母数字._-，最长15，输入 - 恢复默认) [当前 $SERVICE]: " n
+    [ -z "$n" ] && return
+    if [ "$n" = "-" ]; then n=""; else valid_name "$n" || { red "进程名无效: $n"; return 1; }; fi
+    local old_bin="$BIN" old_svc="$SERVICE" old_unit="$UNIT"
+    local new_bin="/usr/local/bin/${n:-ws-tunnel-client}" new_unit="/etc/systemd/system/${n:-ws-client}@.service"
+    [ "$new_unit" = "$old_unit" ] && { yellow "进程名未变化: $SERVICE"; return 0; }
+    [ -e "$new_bin" ] && [ "$new_bin" != "$old_bin" ] && { red "$new_bin 已存在，换个名字"; return 1; }
+    [ -e "$new_unit" ] && { red "$new_unit 已存在，换个名字"; return 1; }
+    if [ -n "$n" ] && { systemctl cat "$n@.service" >/dev/null 2>&1 || systemctl cat "$n.service" >/dev/null 2>&1 || command -v "$n" >/dev/null; }; then
+        red "系统已有同名服务或命令: $n，换个名字"; return 1
+    fi
+    local p en_list="" act_list=""
+    for p in $(ports); do
+        [ "$(systemctl is-enabled "${old_svc}@$p" 2>/dev/null)" = "enabled" ] && en_list="$en_list $p"
+        systemctl is-active -q "${old_svc}@$p" && act_list="$act_list $p"
+        systemctl disable --now "${old_svc}@$p" >/dev/null 2>&1
+    done
+    mkdir -p "$CONF_DIR"
+    if [ -n "$n" ]; then echo "$n" > "$NAME_FILE"; else rm -f "$NAME_FILE"; fi
+    load_name
+    [ -f "$old_bin" ] && mv -f "$old_bin" "$BIN"
+    if [ -f "$old_unit" ]; then
+        rm -f "$old_unit"; write_unit
+        for p in $en_list;  do systemctl enable "${SERVICE}@$p" >/dev/null 2>&1; done
+        for p in $act_list; do systemctl start "${SERVICE}@$p"; done
+    fi
+    green "进程名已改为 $SERVICE（程序 $BIN，服务 ${SERVICE}@端口）"
 }
 
 menu() {
@@ -304,7 +350,7 @@ menu() {
         echo " 7. 启动                 8. 开机启动 开"
         echo " 9. 开机启动 关         10. 卸载"
         echo "11. 修改服务器地址 / 备用服务器  12. 查看版本"
-        echo "13. 设置快捷命令（当前: $(short_name)）"
+        echo "13. 设置快捷命令（当前: $(short_name)）  14. 修改进程名（当前: $SERVICE）"
         echo " 0. 退出"
         read -rp "选择: " n
         case "$n" in
@@ -315,7 +361,7 @@ menu() {
             7) read -rp "端口(留空=全部): " p; each start "$p" ;;
             8) read -rp "端口(留空=全部): " p; each enable "$p" ;;
             9) read -rp "端口(留空=全部): " p; each disable "$p" ;;
-            10) do_uninstall ;; 11) do_server ;; 12) do_version ;; 13) set_shortcut ;; 0) exit 0 ;;
+            10) do_uninstall ;; 11) do_server ;; 12) do_version ;; 13) set_shortcut ;; 14) do_name ;; 0) exit 0 ;;
         esac
     done
 }
@@ -324,6 +370,6 @@ case "$1" in
     install) do_install ;; add) do_add "$2" "$3" "$4" "$5" ;; del) do_del "$2" ;; server) do_server "$2" "$3" ;;
     list) do_list ;; log) do_log "$2" ;;
     restart|stop|start|enable|disable) each "$1" "$2" ;;
-    update) do_update ;; uninstall) do_uninstall ;; version|-v|--version) do_version ;; shortcut) set_shortcut "$2" ;;
+    update) do_update ;; uninstall) do_uninstall ;; version|-v|--version) do_version ;; shortcut) set_shortcut "$2" ;; name) do_name "$2" ;;
     *) ensure_shortcut; menu ;;
 esac
