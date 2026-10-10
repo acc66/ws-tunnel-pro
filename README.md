@@ -138,6 +138,7 @@ bash ws-tunnel.sh log             # 实时日志
 bash ws-tunnel.sh restart | stop | status
 bash ws-tunnel.sh enable | disable       # 开机启动 开/关
 bash ws-tunnel.sh update          # 更新程序
+bash ws-tunnel.sh version         # 查看脚本 / 程序 / 最新版本
 bash ws-tunnel.sh uninstall       # 卸载（保留配置和拉黑文件）
 ```
 
@@ -152,6 +153,7 @@ bash ws-client.sh list            # 查看所有端口
 bash ws-client.sh log [端口]      # 实时日志，不带端口则显示全部
 bash ws-client.sh restart | stop | start | enable | disable [端口]   # 不带端口则作用于全部
 bash ws-client.sh update          # 更新程序并重启全部端口
+bash ws-client.sh version         # 查看脚本 / 程序 / 最新版本
 bash ws-client.sh uninstall
 ```
 
@@ -184,3 +186,9 @@ bash ws-client.sh uninstall
 
 **下载失败**
 - 脚本会从 GitHub Releases 下载程序。如果服务器访问不了 GitHub，可以手动下载 `ws-tunnel-server-tcp-linux-amd64` 或 `ws-tunnel-client-linux-amd64`，和脚本放在同一个目录，再运行安装，脚本会优先使用本地文件。
+
+**加了备用服务器后连不上**
+- A 上的程序是旧版（v1.1.0 之前），不认识逗号分隔的多个地址。执行 `bash ws-client.sh version` 查看，再执行 `bash ws-client.sh update` 更新。新版脚本在 `add` / `server` 时会自动检查并更新。
+
+**查看版本**
+- `bash ws-tunnel.sh version` / `bash ws-client.sh version` 会显示脚本版本、已安装程序版本和 GitHub 最新版本。程序本身也可以用 `-version` 参数查看。

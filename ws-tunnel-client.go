@@ -9,6 +9,7 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -22,6 +23,9 @@ import (
 	"github.com/xtaci/smux"
 )
 
+// version 发布时由 -ldflags "-X main.version=vX.Y.Z" 注入
+var version = "dev"
+
 var (
 	// 命令行参数
 	localAddr  = flag.String("local", "127.0.0.1:1080", "本地监听地址")
@@ -32,6 +36,7 @@ var (
 	dialTO     = flag.Duration("timeout", 5*time.Second, "连接服务器超时（超时即切换备用服务器）")
 	checkEvery = flag.Duration("check", 10*time.Second, "故障服务器的探测间隔（恢复后自动切回）")
 	verbose    = flag.Bool("v", false, "输出每个连接的日志（连接数大时建议关闭）")
+	showVer    = flag.Bool("version", false, "显示版本号")
 )
 
 const (
@@ -59,9 +64,9 @@ func vlog(format string, v ...any) {
 type upstream struct {
 	url string
 
-	mu       sync.Mutex
-	down     bool // 最近一次连接失败
-	noMux    bool // B 端是旧版，不支持多路复用
+	mu    sync.Mutex
+	down  bool // 最近一次连接失败
+	noMux bool // B 端是旧版，不支持多路复用
 	slots []*muxSlot
 	next  int
 }
@@ -359,6 +364,10 @@ func (c *wsConn) Close() error {
 
 func main() {
 	flag.Parse()
+	if *showVer {
+		fmt.Println(version)
+		return
+	}
 
 	for _, s := range strings.Split(*serverAddr, ",") {
 		if s = strings.TrimSpace(s); s == "" {
@@ -373,7 +382,7 @@ func main() {
 		log.Fatal("未配置服务器地址")
 	}
 
-	log.Printf("🚀 WebSocket 隧道客户端启动")
+	log.Printf("🚀 WebSocket 隧道客户端启动 %s", version)
 	log.Printf("📍 本地监听: %s", *localAddr)
 	for i, u := range upstreams {
 		role := "主"

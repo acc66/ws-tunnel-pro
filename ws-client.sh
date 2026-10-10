@@ -8,9 +8,10 @@
 #       bash ws-client.sh server 端口 ws://B1:8080/mm,ws://B2:8080/mm   # 修改服务器/备用服务器
 #       bash ws-client.sh del 端口 | list | log [端口] | restart [端口]
 #                         stop [端口] | start [端口] | enable 端口 | disable 端口
-#                         update | uninstall
+#                         update | uninstall | version
 #================================================================
 
+SCRIPT_VER="v1.2.0"
 REPO="acc66/ws-tunnel-pro"
 BIN="/usr/local/bin/ws-tunnel-client"
 CONF_DIR="/etc/ws-client"
@@ -21,6 +22,36 @@ green() { echo -e "\033[32m$*\033[0m"; }
 yellow(){ echo -e "\033[33m$*\033[0m"; }
 
 [ "$(id -u)" -ne 0 ] && { red "请用 root 运行"; exit 1; }
+
+# ---------- 版本 ----------
+# 已安装程序的版本（v1.1.0 及更早的程序不支持 -version）
+bin_ver() {
+    [ -x "$BIN" ] || { echo "未安装"; return; }
+    local v; v=$("$BIN" -version 2>/dev/null | head -1)
+    [[ "$v" =~ ^(v|dev) ]] && echo "$v" || echo "旧版(v1.1.0 或更早)"
+}
+# GitHub 上的最新版本（查询失败返回空）
+latest_ver() {
+    curl -fsL --connect-timeout 5 -m 10 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
+}
+# ver_lt a b：a 比 b 旧时返回 0
+ver_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "${1#v}" "${2#v}" | sort -V | head -1)" = "${1#v}" ]; }
+do_version() {
+    local b l; b=$(bin_ver); l=$(latest_ver)
+    echo "脚本版本: $SCRIPT_VER"
+    echo "程序版本: $b"
+    if [ -z "$l" ]; then
+        yellow "最新版本: 查询失败（无法访问 GitHub）"; return
+    fi
+    case "$b" in
+        v[0-9]*) if ver_lt "$b" "$l"; then yellow "最新版本: $l（执行 bash $0 update 更新程序）"; else green "最新版本: $l（程序已是最新）"; fi ;;
+        未安装)  yellow "最新版本: $l（执行 bash $0 install 安装）" ;;
+        *)       yellow "最新版本: $l（执行 bash $0 update 更新程序）" ;;
+    esac
+    ver_lt "$SCRIPT_VER" "$l" && yellow "脚本有新版本 $l，重新下载: curl -fLO https://github.com/${REPO}/releases/latest/download/$(basename "$0")"
+    return 0
+}
 
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 
@@ -97,9 +128,17 @@ do_install() {
     green "安装完成，接下来添加端口: bash $0 add"
 }
 
+# 旧版程序（v1.1.0 之前）不认识逗号分隔的多个服务器，会把整串当成一个地址导致连不上
+ensure_new_bin() {
+    [ -x "$BIN" ] && grep -q "X-Tunnel-Mux" "$BIN" && return
+    yellow "当前程序是旧版，不支持备用服务器，先更新程序..."
+    download_bin
+}
+
 do_add() {
     [ -x "$BIN" ] || do_install
     [ -f "$UNIT" ] || write_unit
+    ensure_new_bin
     local p="$1" s="$2" pw="$3" b="${4:-0.0.0.0}"
     [ -z "$p" ]  && read -rp "本地监听端口: " p
     valid_port "$p" || { red "端口无效"; return 1; }
@@ -141,6 +180,7 @@ do_del() {
 
 # 修改某端口的服务器地址（含备用服务器）
 do_server() {
+    ensure_new_bin
     local p="$1" s="$2"
     [ -z "$p" ] && { do_list; read -rp "端口: " p; }
     [ -f "$CONF_DIR/$p.conf" ] || { red "端口 $p 不存在"; return 1; }
@@ -186,7 +226,7 @@ do_log() {
     fi
 }
 
-do_update() { download_bin; each restart; }
+do_update() { download_bin; green "当前程序版本: $(bin_ver)"; each restart; }
 
 do_uninstall() {
     read -rp "确认卸载 ws-client（停止所有端口）？(y/N): " y; [ "$y" != "y" ] && return
@@ -198,7 +238,7 @@ do_uninstall() {
 menu() {
     while true; do
         echo
-        green "======== ws-tunnel 客户端管理（A 服务器） ========"
+        green "======== ws-tunnel 客户端管理（A 服务器）  脚本 $SCRIPT_VER  程序 $(bin_ver) ========"
         do_list
         echo
         echo " 1. 安装 / 更新程序      2. 添加端口"
@@ -206,7 +246,7 @@ menu() {
         echo " 5. 重启                 6. 停止"
         echo " 7. 启动                 8. 开机启动 开"
         echo " 9. 开机启动 关         10. 卸载"
-        echo "11. 修改服务器地址 / 备用服务器"
+        echo "11. 修改服务器地址 / 备用服务器  12. 查看版本"
         echo " 0. 退出"
         read -rp "选择: " n
         case "$n" in
@@ -217,7 +257,7 @@ menu() {
             7) read -rp "端口(留空=全部): " p; each start "$p" ;;
             8) read -rp "端口(留空=全部): " p; each enable "$p" ;;
             9) read -rp "端口(留空=全部): " p; each disable "$p" ;;
-            10) do_uninstall ;; 11) do_server ;; 0) exit 0 ;;
+            10) do_uninstall ;; 11) do_server ;; 12) do_version ;; 0) exit 0 ;;
         esac
     done
 }
@@ -226,5 +266,5 @@ case "$1" in
     install) do_install ;; add) do_add "$2" "$3" "$4" "$5" ;; del) do_del "$2" ;; server) do_server "$2" "$3" ;;
     list) do_list ;; log) do_log "$2" ;;
     restart|stop|start|enable|disable) each "$1" "$2" ;;
-    update) do_update ;; uninstall) do_uninstall ;; *) menu ;;
+    update) do_update ;; uninstall) do_uninstall ;; version|-v|--version) do_version ;; *) menu ;;
 esac

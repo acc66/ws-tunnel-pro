@@ -30,6 +30,9 @@ import (
 	"github.com/xtaci/smux"
 )
 
+// version 发布时由 -ldflags "-X main.version=vX.Y.Z" 注入
+var version = "dev"
+
 var (
 	listenAddr = flag.String("listen", ":8080", "WebSocket 监听地址，多个用逗号分隔")
 	wsPath     = flag.String("path", "/mm", "WebSocket 路径")
@@ -45,6 +48,7 @@ var (
 	allowList = flag.String("allow", "", "永不拉黑的IP，逗号分隔（自己的测试IP等）")
 	noBan     = flag.Bool("no-ban", false, "关闭拉黑（仅返回蜜罐页）")
 	verbose   = flag.Bool("v", false, "输出每个连接的日志（连接数大时建议关闭）")
+	showVer   = flag.Bool("version", false, "显示版本号")
 )
 
 const (
@@ -418,6 +422,10 @@ func (l filterListener) Accept() (net.Conn, error) {
 
 func main() {
 	flag.Parse()
+	if *showVer {
+		fmt.Println(version)
+		return
+	}
 	if *nodeID == "" {
 		*nodeID, _ = os.Hostname()
 	}
@@ -438,7 +446,7 @@ func main() {
 	mux.HandleFunc(*wsPath, handleWebSocketTunnel)
 	mux.HandleFunc("/", handleFakePage)
 
-	log.Printf("🚀 WebSocket TCP 隧道服务器启动")
+	log.Printf("🚀 WebSocket TCP 隧道服务器启动 %s", version)
 	log.Printf("🔑 WebSocket 路径: %s", *wsPath)
 	log.Printf("🎯 目标地址: %s", *targetAddr)
 	switch {

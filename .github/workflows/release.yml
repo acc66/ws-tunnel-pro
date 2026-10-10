@@ -22,7 +22,9 @@ jobs:
       - name: Build
         run: |
           mkdir -p releases
-          LDFLAGS="-s -w"
+          VER="${GITHUB_REF_NAME}"
+          [[ "$VER" == v* ]] || VER="dev-$(git rev-parse --short HEAD)"
+          LDFLAGS="-s -w -X main.version=$VER"
           for arch in amd64 arm64 386; do
             GOOS=linux GOARCH=$arch go build -ldflags="$LDFLAGS" -o releases/ws-tunnel-server-tcp-linux-$arch ws-tunnel-server-tcp.go
             GOOS=linux GOARCH=$arch go build -ldflags="$LDFLAGS" -o releases/ws-tunnel-client-linux-$arch ws-tunnel-client.go

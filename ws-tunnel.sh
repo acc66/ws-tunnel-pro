@@ -5,9 +5,10 @@
 #       bash ws-tunnel.sh install | addport 端口 | delport 端口 | ports
 #                         target ip:port | passwd 新密码 | log | banlog
 #                         bans | unban IP | ban IP | clearbans | allow IP列表 | redis
-#                         restart | stop | status | enable | disable | update | uninstall
+#                         restart | stop | status | enable | disable | update | uninstall | version
 #================================================================
 
+SCRIPT_VER="v1.2.0"
 REPO="acc66/ws-tunnel-pro"
 BIN="/usr/local/bin/ws-tunnel-server-tcp"
 CONF_DIR="/etc/ws-tunnel"
@@ -21,6 +22,36 @@ green() { echo -e "\033[32m$*\033[0m"; }
 yellow(){ echo -e "\033[33m$*\033[0m"; }
 
 [ "$(id -u)" -ne 0 ] && { red "请用 root 运行"; exit 1; }
+
+# ---------- 版本 ----------
+# 已安装程序的版本（v1.1.0 及更早的程序不支持 -version）
+bin_ver() {
+    [ -x "$BIN" ] || { echo "未安装"; return; }
+    local v; v=$("$BIN" -version 2>/dev/null | head -1)
+    [[ "$v" =~ ^(v|dev) ]] && echo "$v" || echo "旧版(v1.1.0 或更早)"
+}
+# GitHub 上的最新版本（查询失败返回空）
+latest_ver() {
+    curl -fsL --connect-timeout 5 -m 10 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
+}
+# ver_lt a b：a 比 b 旧时返回 0
+ver_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "${1#v}" "${2#v}" | sort -V | head -1)" = "${1#v}" ]; }
+do_version() {
+    local b l; b=$(bin_ver); l=$(latest_ver)
+    echo "脚本版本: $SCRIPT_VER"
+    echo "程序版本: $b"
+    if [ -z "$l" ]; then
+        yellow "最新版本: 查询失败（无法访问 GitHub）"; return
+    fi
+    case "$b" in
+        v[0-9]*) if ver_lt "$b" "$l"; then yellow "最新版本: $l（执行 bash $0 update 更新程序）"; else green "最新版本: $l（程序已是最新）"; fi ;;
+        未安装)  yellow "最新版本: $l（执行 bash $0 install 安装）" ;;
+        *)       yellow "最新版本: $l（执行 bash $0 update 更新程序）" ;;
+    esac
+    ver_lt "$SCRIPT_VER" "$l" && yellow "脚本有新版本 $l，重新下载: curl -fLO https://github.com/${REPO}/releases/latest/download/$(basename "$0")"
+    return 0
+}
 
 load_conf() {
     LISTEN=":8080"; TARGET=""; WSPATH="/mm"; PASSWORD=""; ALLOW=""; EXTRA=""
@@ -286,7 +317,7 @@ do_enable()  { systemctl enable "$SERVICE" && green "已开启开机启动"; }
 do_disable() { systemctl disable "$SERVICE" && green "已关闭开机启动"; }
 do_log()     { journalctl -u "$SERVICE" -n 100 -f --no-pager; }
 do_banlog()  { journalctl -u "$SERVICE" --no-pager | grep -E "拉黑|非法访问" | tail -50; }
-do_update()  { download_bin; systemctl restart "$SERVICE"; do_status; }
+do_update()  { download_bin; systemctl restart "$SERVICE"; green "当前程序版本: $(bin_ver)"; do_status; }
 
 do_uninstall() {
     read -rp "确认卸载 ws-tunnel？(y/N): " y; [ "$y" != "y" ] && return
@@ -298,7 +329,7 @@ do_uninstall() {
 menu() {
     while true; do
         echo
-        green "======== ws-tunnel 服务端管理 ========"
+        green "======== ws-tunnel 服务端管理  脚本 $SCRIPT_VER  程序 $(bin_ver) ========"
         do_ports 2>/dev/null
         echo " 1. 安装 / 重新配置      2. 添加端口"
         echo " 3. 删除端口             4. 修改目标地址"
@@ -310,6 +341,7 @@ menu() {
         echo "15. 停止                16. 状态"
         echo "17. 开机启动 开         18. 开机启动 关"
         echo "19. 更新程序            20. 卸载"
+        echo "21. 查看版本"
         echo " 0. 退出"
         read -rp "选择: " n
         case "$n" in
@@ -317,7 +349,7 @@ menu() {
             5) do_passwd ;; 6) do_allow ;; 7) do_log ;; 8) do_banlog ;;
             9) do_bans ;; 10) do_unban ;; 11) do_ban ;; 12) do_clearbans ;;
             13) do_redis ;; 14) do_restart ;; 15) do_stop ;; 16) do_status ;;
-            17) do_enable ;; 18) do_disable ;; 19) do_update ;; 20) do_uninstall ;;
+            17) do_enable ;; 18) do_disable ;; 19) do_update ;; 20) do_uninstall ;; 21) do_version ;;
             0) exit 0 ;;
         esac
     done
@@ -330,5 +362,5 @@ case "$1" in
     clearbans) do_clearbans ;; redis) do_redis ;;
     restart) do_restart ;; stop) do_stop ;; status) do_status ;;
     enable) do_enable ;; disable) do_disable ;;
-    update) do_update ;; uninstall) do_uninstall ;; *) menu ;;
+    update) do_update ;; uninstall) do_uninstall ;; version|-v|--version) do_version ;; *) menu ;;
 esac
