@@ -30,7 +30,7 @@ bash ws-tunnel.sh install
 | WebSocket 路径 | `/mm` | 必须和 A 端一致 |
 | 连接密码 | `你的密码` | 必须和 A 端一致 |
 | 白名单IP | 你自己的公网IP | 永远不会被拉黑，建议填上 |
-| 共享 Redis | 直接回车跳过 | 多台 B 共用黑名单时才需要，见第 5 节 |
+| 共享 Redis | 直接回车跳过 | 多台 B 共用黑名单时才需要，见第 6 节 |
 
 装完后服务已启动并设为开机自启。云服务器记得在安全组放行监听端口。
 
@@ -67,7 +67,41 @@ A 默认把所有用户连接复用到每个 B 服务器的 4 条 WebSocket 长�
 - 调整复用条数：编辑 `/etc/ws-client/端口.conf`，例如 `EXTRA="-mux 8"`；`-mux 0` 关闭复用。
 - 其他参数：`-timeout 5s`（连接超时，超时即切备用）、`-check 10s`（故障服务器探测间隔）、`-v`（输出每个连接的日志，默认关闭以减少日志量）。
 
-## 3. 验证
+## 3. 更新到新版
+
+旧版脚本没有快捷命令，第一次更新要先下载新脚本。顺序是先更新 B，再更新 A（新 A 连旧 B 也能用，只是暂时不启用多路复用）。
+
+B 服务器（每台都要执行）：
+
+```bash
+curl -fLO https://github.com/acc66/ws-tunnel-pro/releases/latest/download/ws-tunnel.sh
+bash ws-tunnel.sh update
+```
+
+A 服务器：
+
+```bash
+curl -fLO https://github.com/acc66/ws-tunnel-pro/releases/latest/download/ws-client.sh
+bash ws-client.sh update
+```
+
+更新会保留原来的配置（端口、密码、目标地址、拉黑文件），并自动创建快捷命令。之后再更新只要一条命令：
+
+```bash
+wst update    # B 服务器
+wsc update    # A 服务器
+```
+
+确认版本：
+
+```bash
+wst version   # B 服务器
+wsc version   # A 服务器
+```
+
+会显示脚本版本、程序版本和 GitHub 最新版本。显示"程序已是最新"就是更新成功了。
+
+## 4. 验证
 
 ```bash
 # A 服务器上
@@ -80,7 +114,7 @@ bash ws-tunnel.sh log           # 每分钟输出 WebSocket 连接数和转发�
 
 注意：不要用浏览器或 `curl http://B_IP:8080/` 去测 B，路径不是 `/mm` 会把你自己拉黑。要测伪装页的话，先把自己的 IP 加进白名单。
 
-## 4. 拉黑规则与管理（B 服务器）
+## 5. 拉黑规则与管理（B 服务器）
 
 | 请求 | 结果 |
 |---|---|
@@ -108,7 +142,7 @@ bash ws-tunnel.sh banlog          # 查看拉黑日志
 
 完全关闭拉黑：编辑 `/etc/ws-tunnel/ws-tunnel.conf`，把 `EXTRA=""` 改成 `EXTRA="-no-ban"`，然后执行 `bash ws-tunnel.sh restart`。
 
-## 5. 多台 B 共享黑名单（可选）
+## 6. 多台 B 共享黑名单（可选）
 
 有多台 B 服务器时，可以让它们共用一个 Redis，一台拉黑，其他几台约 60 秒内同步生效。
 
@@ -123,7 +157,7 @@ bash ws-tunnel.sh redis    # 选 1，填 REDIS_HOST / PORT / PASS / NODE_ID
 
 Redis 一定要设密码，不要直接暴露在公网上。
 
-## 6. 常用命令速查
+## 7. 常用命令速查
 
 ### B 服务器 `ws-tunnel.sh`
 
@@ -175,7 +209,7 @@ wst shortcut ws     # B 服务器
 
 名字不能和系统已有命令重名（比如装了 PHP 的机器上 `php` 就不能用）。`update` 会同时更新脚本和程序。
 
-## 7. 文件位置
+## 8. 文件位置
 
 | 服务器 | 路径 | 内容 |
 |---|---|---|
@@ -189,7 +223,7 @@ wst shortcut ws     # B 服务器
 
 手动改了配置文件后，执行 `restart` 生效。
 
-## 8. 常见问题
+## 9. 常见问题
 
 **A 端日志出现“连接服务器失败”**
 - 检查 B 的服务是否在运行：`bash ws-tunnel.sh status`。
