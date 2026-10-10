@@ -157,6 +157,24 @@ bash ws-client.sh version         # 查看脚本 / 程序 / 最新版本
 bash ws-client.sh uninstall
 ```
 
+### 快捷命令
+
+第一次运行脚本后会自动创建快捷命令，以后不用再输入 `bash xxx.sh`：
+
+| 服务器 | 默认快捷命令 | 示例 |
+|---|---|---|
+| A | `wsc` | `wsc`（打开菜单）、`wsc list`、`wsc log 1080`、`wsc update` |
+| B | `wst` | `wst`（打开菜单）、`wst bans`、`wst log`、`wst update` |
+
+想换成自己习惯的名字（比如 `ws`）：
+
+```bash
+wsc shortcut ws     # A 服务器
+wst shortcut ws     # B 服务器
+```
+
+名字不能和系统已有命令重名（比如装了 PHP 的机器上 `php` 就不能用）。`update` 会同时更新脚本和程序。
+
 ## 7. 文件位置
 
 | 服务器 | 路径 | 内容 |

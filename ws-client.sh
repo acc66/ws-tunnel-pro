@@ -8,11 +8,13 @@
 #       bash ws-client.sh server 端口 ws://B1:8080/mm,ws://B2:8080/mm   # 修改服务器/备用服务器
 #       bash ws-client.sh del 端口 | list | log [端口] | restart [端口]
 #                         stop [端口] | start [端口] | enable 端口 | disable 端口
-#                         update | uninstall | version
+#                         update | uninstall | version | shortcut [名字]   # 快捷命令，默认 wsc
 #================================================================
 
-SCRIPT_VER="v1.2.0"
+SCRIPT_VER="v1.3.0"
 REPO="acc66/ws-tunnel-pro"
+SCRIPT_NAME="ws-client.sh"
+SHORT_DEFAULT="wsc"
 BIN="/usr/local/bin/ws-tunnel-client"
 CONF_DIR="/etc/ws-client"
 UNIT="/etc/systemd/system/ws-client@.service"
@@ -45,12 +47,65 @@ do_version() {
         yellow "最新版本: 查询失败（无法访问 GitHub）"; return
     fi
     case "$b" in
-        v[0-9]*) if ver_lt "$b" "$l"; then yellow "最新版本: $l（执行 bash $0 update 更新程序）"; else green "最新版本: $l（程序已是最新）"; fi ;;
-        未安装)  yellow "最新版本: $l（执行 bash $0 install 安装）" ;;
-        *)       yellow "最新版本: $l（执行 bash $0 update 更新程序）" ;;
+        v[0-9]*) if ver_lt "$b" "$l"; then yellow "最新版本: $l（执行 $(CMD) update 更新程序）"; else green "最新版本: $l（程序已是最新）"; fi ;;
+        未安装)  yellow "最新版本: $l（执行 $(CMD) install 安装）" ;;
+        *)       yellow "最新版本: $l（执行 $(CMD) update 更新程序）" ;;
     esac
-    ver_lt "$SCRIPT_VER" "$l" && yellow "脚本有新版本 $l，重新下载: curl -fLO https://github.com/${REPO}/releases/latest/download/$(basename "$0")"
+    ver_lt "$SCRIPT_VER" "$l" && yellow "脚本有新版本 $l，重新下载: curl -fLO https://github.com/${REPO}/releases/latest/download/${SCRIPT_NAME}（或执行 $(CMD) update）"
     return 0
+}
+
+# ---------- 快捷命令（把脚本装到 /usr/local/bin，之后直接输入命令名即可打开菜单） ----------
+SHORT_FILE="$CONF_DIR/.shortcut"
+short_name() { [ -f "$SHORT_FILE" ] && cat "$SHORT_FILE" || echo ""; }
+# 提示里显示的命令：有快捷命令用快捷命令，否则 bash 脚本路径
+CMD() { local n; n=$(short_name); [ -n "$n" ] && [ -x "/usr/local/bin/$n" ] && echo "$n" || echo "bash $0"; }
+
+# 把当前脚本写到 /usr/local/bin/$1（脚本不是普通文件时从 GitHub 下载）
+write_script() {
+    local dst="/usr/local/bin/$1" tmp="/usr/local/bin/.$1.tmp.$$"
+    if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$(readlink -f "$dst" 2>/dev/null)" ]; then
+        cp -f "$0" "$tmp"
+    elif [ -f "$0" ]; then
+        return 0
+    else
+        curl -fsL --connect-timeout 15 -o "$tmp" "https://github.com/${REPO}/releases/latest/download/${SCRIPT_NAME}" || { rm -f "$tmp"; return 1; }
+    fi
+    chmod 755 "$tmp" && mv -f "$tmp" "$dst"
+}
+
+set_shortcut() {
+    local n="$1" old; old=$(short_name)
+    [ -z "$n" ] && { read -rp "快捷命令名 [${old:-$SHORT_DEFAULT}]: " n; n="${n:-${old:-$SHORT_DEFAULT}}"; }
+    [[ "$n" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,31}$ ]] || { red "名字只能用字母、数字、_ -，且以字母开头"; return 1; }
+    # 不能覆盖系统已有命令（自己装过的除外）
+    local p; p=$(command -v "$n" 2>/dev/null)
+    if [ -n "$p" ] && ! grep -q "$REPO" "$p" 2>/dev/null; then
+        red "命令 $n 已存在（$p），换一个名字"; return 1
+    fi
+    write_script "$n" || { red "写入 /usr/local/bin/$n 失败"; return 1; }
+    [ -n "$old" ] && [ "$old" != "$n" ] && grep -q "$REPO" "/usr/local/bin/$old" 2>/dev/null && rm -f "/usr/local/bin/$old"
+    mkdir -p "$CONF_DIR"; echo "$n" > "$SHORT_FILE"
+    green "快捷命令已设置：以后直接输入 $n 打开菜单（例如 $n list、$n log）"
+}
+
+# 首次安装时自动创建默认快捷命令
+ensure_shortcut() {
+    local n; n=$(short_name)
+    [ -n "$n" ] && [ -x "/usr/local/bin/$n" ] && return 0
+    set_shortcut "${n:-$SHORT_DEFAULT}" >/dev/null 2>&1 && green "快捷命令: 以后直接输入 $(short_name) 打开菜单（$(CMD) shortcut 可改名）"
+    return 0
+}
+
+# 更新脚本自身（快捷命令指向的那份）
+update_script() {
+    local n; n=$(short_name); [ -z "$n" ] && return 0
+    local tmp; tmp=$(mktemp)
+    if curl -fsL --connect-timeout 15 -o "$tmp" "https://github.com/${REPO}/releases/latest/download/${SCRIPT_NAME}" && bash -n "$tmp" && grep -q "$REPO" "$tmp"; then
+        chmod 755 "$tmp" && mv -f "$tmp" "/usr/local/bin/$n" && green "脚本已更新: $(grep -m1 '^SCRIPT_VER=' "/usr/local/bin/$n" | cut -d'"' -f2)"
+    else
+        rm -f "$tmp"; yellow "脚本更新失败（不影响程序更新）"
+    fi
 }
 
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
@@ -125,7 +180,8 @@ do_install() {
     download_bin
     mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
     write_unit
-    green "安装完成，接下来添加端口: bash $0 add"
+    ensure_shortcut
+    green "安装完成，接下来添加端口: $(CMD) add"
 }
 
 # 旧版程序（v1.1.0 之前）不认识逗号分隔的多个服务器，会把整串当成一个地址导致连不上
@@ -166,7 +222,7 @@ EOF
         green "已添加 $b:$p → $s（已开机启动）"
         open_firewall "$p"
     else
-        red "启动失败，查看日志: bash $0 log $p"
+        red "启动失败，查看日志: $(CMD) log $p"
     fi
 }
 
@@ -226,12 +282,13 @@ do_log() {
     fi
 }
 
-do_update() { download_bin; green "当前程序版本: $(bin_ver)"; each restart; }
+do_update() { ensure_shortcut; update_script; download_bin; green "当前程序版本: $(bin_ver)"; each restart; }
 
 do_uninstall() {
     read -rp "确认卸载 ws-client（停止所有端口）？(y/N): " y; [ "$y" != "y" ] && return
     for p in $(ports); do systemctl disable --now "ws-client@$p" >/dev/null 2>&1; done
     rm -f "$UNIT" "$BIN"; systemctl daemon-reload
+    local n; n=$(short_name); [ -n "$n" ] && grep -q "$REPO" "/usr/local/bin/$n" 2>/dev/null && rm -f "/usr/local/bin/$n"; rm -f "$SHORT_FILE"
     green "已卸载（保留配置目录 $CONF_DIR）"
 }
 
@@ -247,6 +304,7 @@ menu() {
         echo " 7. 启动                 8. 开机启动 开"
         echo " 9. 开机启动 关         10. 卸载"
         echo "11. 修改服务器地址 / 备用服务器  12. 查看版本"
+        echo "13. 设置快捷命令（当前: $(short_name)）"
         echo " 0. 退出"
         read -rp "选择: " n
         case "$n" in
@@ -257,7 +315,7 @@ menu() {
             7) read -rp "端口(留空=全部): " p; each start "$p" ;;
             8) read -rp "端口(留空=全部): " p; each enable "$p" ;;
             9) read -rp "端口(留空=全部): " p; each disable "$p" ;;
-            10) do_uninstall ;; 11) do_server ;; 12) do_version ;; 0) exit 0 ;;
+            10) do_uninstall ;; 11) do_server ;; 12) do_version ;; 13) set_shortcut ;; 0) exit 0 ;;
         esac
     done
 }
@@ -266,5 +324,6 @@ case "$1" in
     install) do_install ;; add) do_add "$2" "$3" "$4" "$5" ;; del) do_del "$2" ;; server) do_server "$2" "$3" ;;
     list) do_list ;; log) do_log "$2" ;;
     restart|stop|start|enable|disable) each "$1" "$2" ;;
-    update) do_update ;; uninstall) do_uninstall ;; version|-v|--version) do_version ;; *) menu ;;
+    update) do_update ;; uninstall) do_uninstall ;; version|-v|--version) do_version ;; shortcut) set_shortcut "$2" ;;
+    *) ensure_shortcut; menu ;;
 esac
