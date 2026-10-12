@@ -10,14 +10,18 @@
 #                         stop [端口] | start [端口] | enable 端口 | disable 端口
 #                         update | uninstall | version | shortcut [名字]   # 快捷命令，默认 wsc
 #                         name 进程名   # 自定义进程名（- 恢复默认）
+#                         filter [on|off|redis]   # 反探测拉黑：路径不是 /mm、非 HTTP 数据 → 拉黑IP
+#                         bans | ban IP | unban IP | banlog | clearbans
 #================================================================
 
-SCRIPT_VER="v1.4.0"
+SCRIPT_VER="v1.5.0"
 REPO="acc66/ws-tunnel-pro"
 SCRIPT_NAME="ws-client.sh"
 SHORT_DEFAULT="wsc"
 CONF_DIR="/etc/ws-client"
 
+FILTER_CONF="$CONF_DIR/filter.conf"   # 反探测拉黑配置（所有端口共用）
+BLFILE="$CONF_DIR/blacklist.txt"       # 拉黑文件（所有端口共用）
 NAME_FILE="$CONF_DIR/name"   # 自定义进程名（ps/top/systemctl 中显示的名字）
 
 # 读取进程名: 未设置用默认名；设置后程序文件名和 systemd 服务名都用它
@@ -131,7 +135,7 @@ valid_servers() {
         [[ "$x" =~ ^wss?://[^[:space:]\"\']+$ ]] || { red "地址无效: $x（必须以 ws:// 或 wss:// 开头）"; return 1; }
     done
 }
-ports() { ls "$CONF_DIR"/*.conf 2>/dev/null | sed 's#.*/##; s#\.conf$##' | sort -n; }
+ports() { ls "$CONF_DIR"/*.conf 2>/dev/null | sed 's#.*/##; s#.conf$##' | grep -E '^[0-9]+$' | sort -n; }
 
 write_unit() {
     cat > "$UNIT" <<EOF
@@ -143,7 +147,9 @@ StartLimitIntervalSec=0
 
 [Service]
 EnvironmentFile=$CONF_DIR/%i.conf
-ExecStart=/bin/sh -c 'exec $BIN -local "\$BIND:%i" -server "\$SERVER" -password "\$PASSWORD" \$EXTRA'
+# 反探测拉黑配置（所有端口共用，文件不存在则关闭过滤）
+EnvironmentFile=-$FILTER_CONF
+ExecStart=/bin/sh -c 'exec $BIN -local "\$BIND:%i" -server "\$SERVER" -password "\$PASSWORD" -path "\$FPATH" -blacklist $BLFILE -allow "\$FALLOW" -redis-host "\$REDIS_HOST" -redis-port "\${REDIS_PORT:-6379}" -redis-pass "\$REDIS_PASS" -node "\$NODE_ID" \$EXTRA'
 Restart=always
 RestartSec=3
 LimitNOFILE=1000000
@@ -164,10 +170,10 @@ download_bin() {
     esac
     local here; here="$(cd "$(dirname "$0")" && pwd)/ws-tunnel-client-linux-${arch}"
     if [ -f "$here" ]; then
-        if grep -q "X-Tunnel-Mux" "$here"; then
+        if grep -q "ws-client-filter-v1" "$here"; then
             install -m 755 "$here" "$BIN"; green "已安装本地文件 $here → $BIN"; return
         fi
-        yellow "本地文件 $here 是旧版（不支持多路复用/备用服务器），改为从 GitHub 下载新版"
+        yellow "本地文件 $here 是旧版（不支持拉黑/备用服务器），改为从 GitHub 下载新版"
     fi
     command -v curl >/dev/null || { apt-get install -y curl 2>/dev/null || yum install -y curl; }
     local url="https://github.com/${REPO}/releases/latest/download/ws-tunnel-client-linux-${arch}"
@@ -198,10 +204,10 @@ do_install() {
     green "安装完成，接下来添加端口: $(CMD) add"
 }
 
-# 旧版程序（v1.1.0 之前）不认识逗号分隔的多个服务器，会把整串当成一个地址导致连不上
+# 旧版程序不认识备用服务器和拉黑参数（-path/-blacklist/-redis-*），会启动失败或连不上
 ensure_new_bin() {
-    [ -x "$BIN" ] && grep -q "X-Tunnel-Mux" "$BIN" && return
-    yellow "当前程序是旧版，不支持备用服务器，先更新程序..."
+    [ -x "$BIN" ] && grep -q "ws-client-filter-v1" "$BIN" && return
+    yellow "当前程序是旧版，不支持拉黑/备用服务器，先更新程序..."
     download_bin
 }
 
@@ -296,7 +302,7 @@ do_log() {
     fi
 }
 
-do_update() { ensure_shortcut; update_script; download_bin; green "当前程序版本: $(bin_ver)"; each restart; }
+do_update() { ensure_shortcut; update_script; download_bin; write_unit; green "当前程序版本: $(bin_ver)"; each restart; }
 
 do_uninstall() {
     read -rp "确认卸载 ws-client（停止所有端口）？(y/N): " y; [ "$y" != "y" ] && return
@@ -338,11 +344,154 @@ do_name() {
     green "进程名已改为 $SERVICE（程序 $BIN，服务 ${SERVICE}@端口）"
 }
 
+# ---------- 反探测拉黑（A 服务器，所有端口共用） ----------
+# 开启后：访问路径不是 FPATH、非 HTTP 数据 → 拉黑IP；B 端密码错误由 B 拉黑，经共享 Redis 同步到 A
+load_filter() {
+    FPATH=""; FALLOW=""; REDIS_HOST=""; REDIS_PORT="6379"; REDIS_PASS=""; NODE_ID="$(hostname)"
+    [ -f "$FILTER_CONF" ] && . "$FILTER_CONF"
+}
+
+save_filter() {
+    mkdir -p "$CONF_DIR"
+    cat > "$FILTER_CONF" <<EOT
+# 反探测拉黑配置（所有端口共用），修改后执行: $(CMD) restart
+# FPATH 留空 = 关闭过滤（原样转发任何数据）
+FPATH="$FPATH"
+FALLOW="$FALLOW"
+# 共享 Redis（可选，与 B 服务器填同一个库即 A/B 共用黑名单）
+REDIS_HOST="$REDIS_HOST"
+REDIS_PORT="$REDIS_PORT"
+REDIS_PASS="$REDIS_PASS"
+NODE_ID="$NODE_ID"
+EOT
+    chmod 600 "$FILTER_CONF"
+}
+
+redis_cli() {
+    [ -z "$REDIS_HOST" ] && return 2
+    command -v redis-cli >/dev/null || { red "未安装 redis-cli（apt install redis-tools / yum install redis）"; return 1; }
+    if [ -n "$REDIS_PASS" ]; then
+        redis-cli -h "$REDIS_HOST" -p "${REDIS_PORT:-6379}" -a "$REDIS_PASS" --no-auth-warning "$@"
+    else
+        redis-cli -h "$REDIS_HOST" -p "${REDIS_PORT:-6379}" "$@"
+    fi
+}
+
+filter_status() {
+    load_filter
+    if [ -n "$FPATH" ]; then
+        echo "反探测拉黑: 开启（合法路径 $FPATH，拉黑 $(bl_count) 个IP，共享Redis: ${REDIS_HOST:-未启用}）"
+    else
+        echo "反探测拉黑: 关闭（$(CMD) filter 开启）"
+    fi
+}
+
+# 开启 / 修改 / 关闭反探测拉黑
+do_filter() {
+    ensure_new_bin
+    load_filter
+    filter_status
+    local n="$1"
+    [ -z "$n" ] && read -rp "1=开启/修改  2=关闭  3=共享 Redis 设置  其他=返回: " n
+    case "$n" in
+        1|on)
+            read -rp "合法 WebSocket 路径（与 B 端一致）[${FPATH:-/mm}]: " v; FPATH="${v:-${FPATH:-/mm}}"
+            [[ "$FPATH" == /* ]] || { red "路径必须以 / 开头"; return 1; }
+            read -rp "白名单IP(逗号分隔，永不拉黑，建议填自己的IP，输入 - 清空) [$FALLOW]: " a
+            [ "$a" = "-" ] && FALLOW="" || { [ -n "$a" ] && FALLOW="$a"; }
+            yellow "注意: 开启后这台 A 的所有端口只接受 $FPATH 的 WebSocket 流量，其他协议会被拉黑"
+            ;;
+        2|off) FPATH="" ;;
+        3|redis)
+            read -rp "1=启用/修改 Redis  2=关闭 Redis: " m
+            if [ "$m" = "1" ]; then
+                read -rp "REDIS_HOST [${REDIS_HOST:-127.0.0.1}]: " rh; REDIS_HOST="${rh:-${REDIS_HOST:-127.0.0.1}}"
+                read -rp "REDIS_PORT [$REDIS_PORT]: " rp; [ -n "$rp" ] && REDIS_PORT="$rp"
+                read -rsp "REDIS_PASS [${REDIS_PASS:+已设置}]: " rpw; echo; [ -n "$rpw" ] && REDIS_PASS="$rpw"
+                read -rp "NODE_ID [$NODE_ID]: " nid; [ -n "$nid" ] && NODE_ID="$nid"
+            elif [ "$m" = "2" ]; then
+                REDIS_HOST=""
+            else
+                return
+            fi
+            ;;
+        *) return ;;
+    esac
+    save_filter
+    write_unit   # 老版本 unit 不带拉黑参数，统一重写
+    each restart >/dev/null
+    filter_status
+}
+
+bl_count() { [ -f "$BLFILE" ] && grep -cvE '^[[:space:]]*(#|$)' "$BLFILE" || echo 0; }
+
+valid_ip() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$1" =~ ^[0-9a-fA-F:]+$ ]]; }
+
+do_bans() {
+    load_filter
+    if [ -s "$BLFILE" ]; then
+        green "本地拉黑文件 $BLFILE 共 $(bl_count) 个IP（最近 50 条）："
+        grep -vE '^[[:space:]]*(#|$)' "$BLFILE" | tail -50 | sed 's/^/  /'
+    else
+        yellow "本地拉黑文件为空"
+    fi
+    [ -z "$REDIS_HOST" ] && return
+    local total; total=$(redis_cli ZCARD bl:rank) || { red "Redis 连接失败"; return 1; }
+    echo
+    green "共享 Redis 黑名单共 $total 个IP（按触发次数排序，前 50）："
+    redis_cli ZREVRANGE bl:rank 0 49 WITHSCORES | paste - - | while read -r ip cnt; do
+        printf "  %-40s 次数:%-5s 节点:%s\n" "$ip" "$cnt" "$(redis_cli HGET "bl:$ip" node)"
+    done
+}
+
+do_unban() {
+    load_filter
+    local ip="$1"; [ -z "$ip" ] && read -rp "要解封的IP: " ip
+    valid_ip "$ip" || { red "IP 格式无效"; return 1; }
+    if [ -f "$BLFILE" ]; then
+        local tmp="$BLFILE.tmp.$$"
+        # 精确匹配行首IP，避免 1.2.3.4 误删 1.2.3.45
+        awk -v ip="$ip" '{ split($0, a, /[ \t#]/); if (a[1] != ip) print }' "$BLFILE" > "$tmp" && mv -f "$tmp" "$BLFILE"
+    fi
+    if [ -n "$REDIS_HOST" ]; then
+        redis_cli ZREM bl:rank "$ip" >/dev/null && redis_cli DEL "bl:$ip" >/dev/null || red "Redis 解封失败"
+    fi
+    green "已解封 $ip（约 5 秒内生效${REDIS_HOST:+，其他节点在下次 Redis 同步时生效}）"
+}
+
+do_ban() {
+    load_filter
+    local ip="$1"; [ -z "$ip" ] && read -rp "要拉黑的IP: " ip
+    valid_ip "$ip" || { red "IP 格式无效"; return 1; }
+    mkdir -p "$CONF_DIR"
+    if grep -qE "^$ip([ \t#]|\$)" "$BLFILE" 2>/dev/null; then
+        yellow "$ip 已在拉黑文件中"
+    else
+        echo "$ip # $(date '+%F %T') manual" >> "$BLFILE"
+    fi
+    if [ -n "$REDIS_HOST" ]; then
+        local ts; ts=$(date +%s)
+        redis_cli HINCRBY "bl:$ip" count 1 >/dev/null || { red "Redis 写入失败"; return 1; }
+        redis_cli HSET "bl:$ip" ip "$ip" node "manual" last "$ts" >/dev/null
+        redis_cli HSETNX "bl:$ip" first "$ts" >/dev/null
+        redis_cli ZINCRBY bl:rank 1 "$ip" >/dev/null
+    fi
+    green "已拉黑 $ip（约 5 秒内生效）"
+}
+
+do_clearbans() {
+    read -rp "确认清空本地拉黑文件 $BLFILE？(y/N): " y; [ "$y" != "y" ] && return
+    : > "$BLFILE"; green "已清空（共享 Redis 中的不受影响）"
+}
+
+do_banlog() { journalctl -u "${SERVICE}@*" --no-pager | grep -E "拉黑|非法访问" | tail -50; }
+
 menu() {
     while true; do
         echo
         green "======== ws-tunnel 客户端管理（A 服务器）  脚本 $SCRIPT_VER  程序 $(bin_ver) ========"
         do_list
+        filter_status
         echo
         echo " 1. 安装 / 更新程序      2. 添加端口"
         echo " 3. 删除端口             4. 查看实时日志"
@@ -351,6 +500,9 @@ menu() {
         echo " 9. 开机启动 关         10. 卸载"
         echo "11. 修改服务器地址 / 备用服务器  12. 查看版本"
         echo "13. 设置快捷命令（当前: $(short_name)）  14. 修改进程名（当前: $SERVICE）"
+        echo "15. 反探测拉黑 开/关/Redis  16. 查看拉黑IP"
+        echo "17. 解封IP              18. 手动拉黑IP"
+        echo "19. 查看拉黑日志        20. 清空拉黑文件"
         echo " 0. 退出"
         read -rp "选择: " n
         case "$n" in
@@ -361,7 +513,8 @@ menu() {
             7) read -rp "端口(留空=全部): " p; each start "$p" ;;
             8) read -rp "端口(留空=全部): " p; each enable "$p" ;;
             9) read -rp "端口(留空=全部): " p; each disable "$p" ;;
-            10) do_uninstall ;; 11) do_server ;; 12) do_version ;; 13) set_shortcut ;; 14) do_name ;; 0) exit 0 ;;
+            10) do_uninstall ;; 11) do_server ;; 12) do_version ;; 13) set_shortcut ;; 14) do_name ;;
+            15) do_filter ;; 16) do_bans ;; 17) do_unban ;; 18) do_ban ;; 19) do_banlog ;; 20) do_clearbans ;; 0) exit 0 ;;
         esac
     done
 }
@@ -371,5 +524,6 @@ case "$1" in
     list) do_list ;; log) do_log "$2" ;;
     restart|stop|start|enable|disable) each "$1" "$2" ;;
     update) do_update ;; uninstall) do_uninstall ;; version|-v|--version) do_version ;; shortcut) set_shortcut "$2" ;; name) do_name "$2" ;;
+    filter) do_filter "$2" ;; bans) do_bans ;; unban) do_unban "$2" ;; ban) do_ban "$2" ;; banlog) do_banlog ;; clearbans) do_clearbans ;;
     *) ensure_shortcut; menu ;;
 esac

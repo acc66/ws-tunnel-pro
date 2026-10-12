@@ -2,7 +2,8 @@ package main
 
 // B 服务器：WebSocket → TCP 隧道 + 反探测黑名单
 // - 路径不是 -path（默认 /mm）→ 拉黑IP（追加到本地拉黑文件，可选同时写入共享 Redis）+ 返回 nginx 蜜罐页
-// - 路径正确但密码错误/非 WebSocket → 返回蜜罐页，不拉黑
+// - 路径正确但密码错误/没带密码 → 拉黑IP + 返回蜜罐页（-ban-auth=false 时只返回蜜罐页）
+// - 密码正确但不是 WebSocket 升级请求 → 返回蜜罐页，不拉黑
 // - 黑名单IP → 连接建立时直接断开
 // 拉黑文件每行一个IP（# 后为注释），文件被修改后自动重新加载（手动删行即解封）
 // 配置 -redis-host 后黑名单与 Redis bl:rank 多节点共享（与 gotcp-filter 同结构）
@@ -47,6 +48,7 @@ var (
 	syncEvery = flag.Duration("sync", 60*time.Second, "从 Redis 同步黑名单间隔")
 	allowList = flag.String("allow", "", "永不拉黑的IP，逗号分隔（自己的测试IP等）")
 	noBan     = flag.Bool("no-ban", false, "关闭拉黑（仅返回蜜罐页）")
+	banAuth   = flag.Bool("ban-auth", true, "路径正确但密码错误（或没带密码）也拉黑；关闭后只返回蜜罐页")
 	verbose   = flag.Bool("v", false, "输出每个连接的日志（连接数大时建议关闭）")
 	showVer   = flag.Bool("version", false, "显示版本号")
 )
@@ -483,10 +485,18 @@ func handleWebSocketTunnel(w http.ResponseWriter, r *http.Request) {
 		handleFakePage(w, r)
 		return
 	}
-	// 验证密码：错误只给蜜罐，不拉黑（避免误封自己）；常量时间比较防止计时侧信道
+	// 验证密码：错误即拉黑（-ban-auth=false 时只给蜜罐）；常量时间比较防止计时侧信道
 	authHeader := r.Header.Get("Authorization")
-	if subtle.ConstantTimeCompare([]byte(authHeader), []byte("Bearer "+*password)) != 1 || !websocket.IsWebSocketUpgrade(r) {
-		log.Printf("❌ 未授权访问: %s", r.RemoteAddr)
+	if subtle.ConstantTimeCompare([]byte(authHeader), []byte("Bearer "+*password)) != 1 {
+		log.Printf("❌ 密码错误: %s %s %s", r.RemoteAddr, r.Method, r.URL.Path)
+		if *banAuth {
+			ban(remoteIP(r.RemoteAddr), "密码错误 "+r.Method+" "+r.URL.Path)
+		}
+		writeFakePage(w)
+		return
+	}
+	if !websocket.IsWebSocketUpgrade(r) {
+		log.Printf("❌ 非 WebSocket 请求: %s", r.RemoteAddr)
 		writeFakePage(w)
 		return
 	}

@@ -119,9 +119,12 @@ bash ws-tunnel.sh log           # 每分钟输出 WebSocket 连接数和转发�
 | 请求 | 结果 |
 |---|---|
 | 路径是 `/mm`、密码正确、是 WebSocket | 正常转发 |
-| 路径是 `/mm`，但密码错误或不是 WebSocket | 返回伪装页，不拉黑 |
+| 路径是 `/mm`，但密码错误或没带密码 | 返回伪装页，并拉黑 IP |
+| 路径是 `/mm`、密码正确，但不是 WebSocket | 返回伪装页，不拉黑 |
 | 其他任何路径（包括 `/mm/xxx`） | 返回伪装页，并拉黑 IP |
 | 已被拉黑的 IP | 连接直接断开 |
+
+密码错误不想拉黑：把 `/etc/ws-tunnel/ws-tunnel.conf` 里的 `EXTRA=""` 改成 `EXTRA="-ban-auth=false"`，再 `bash ws-tunnel.sh restart`。
 
 拉黑的 IP 保存在 `/etc/ws-tunnel/blacklist.txt`，每行一个，`#` 后面是时间和原因：
 
@@ -142,9 +145,38 @@ bash ws-tunnel.sh banlog          # 查看拉黑日志
 
 完全关闭拉黑：编辑 `/etc/ws-tunnel/ws-tunnel.conf`，把 `EXTRA=""` 改成 `EXTRA="-no-ban"`，然后执行 `bash ws-tunnel.sh restart`。
 
-## 6. 多台 B 共享黑名单（可选）
+## 6. A 服务器拉黑（可选）
 
-有多台 B 服务器时，可以让它们共用一个 Redis，一台拉黑，其他几台约 60 秒内同步生效。
+A 服务器的端口默认原样转发任何数据。开启反探测后，浏览器或扫描器直接访问 A（如 `http://A_IP:88/admin`）也会被拉黑：
+
+```bash
+bash ws-client.sh filter     # 选 1，填合法路径（和 B 一致，如 /mm）和自己的白名单IP
+```
+
+| 访问 A 的请求 | 结果 |
+|---|---|
+| 路径是 `/mm`、是 WebSocket | 转发给 B（密码由 B 校验，错误时 B 拉黑） |
+| 路径是 `/mm`，但不是 WebSocket | 返回伪装页，不拉黑 |
+| 其他任何路径（`/`、`/admin` 等） | 返回伪装页，并拉黑 IP |
+| 不是 HTTP 的数据（随机字节探测等） | 断开，并拉黑 IP |
+| 已被拉黑的 IP | 连接直接断开 |
+
+- 开启后这台 A 所有端口都只接受 WebSocket 隧道流量。端口前面接的是 HAProxy/Xray 等其他协议时不要开。
+- 拉黑文件 `/etc/ws-client/blacklist.txt`，所有端口共用，格式和 B 一样，删一行即解封。
+- 想让 B 上"密码错误"拉黑的 IP 也在 A 上生效：A 和 B 配同一个 Redis（`bash ws-client.sh filter` 选 3），约 60 秒内同步。
+
+```bash
+bash ws-client.sh bans            # 查看拉黑的 IP（含共享 Redis）
+bash ws-client.sh unban 1.2.3.4   # 解封（本地文件 + Redis）
+bash ws-client.sh ban 1.2.3.4     # 手动拉黑
+bash ws-client.sh banlog          # 查看拉黑日志
+bash ws-client.sh clearbans       # 清空拉黑文件
+bash ws-client.sh filter off      # 关闭过滤
+```
+
+## 7. 多台服务器共享黑名单（可选）
+
+有多台 A/B 服务器时，可以让它们共用一个 Redis，一台拉黑，其他几台约 60 秒内同步生效（A 端用 `bash ws-client.sh filter` 选 3 配置）。
 
 ```bash
 bash ws-tunnel.sh redis    # 选 1，填 REDIS_HOST / PORT / PASS / NODE_ID
@@ -157,7 +189,7 @@ bash ws-tunnel.sh redis    # 选 1，填 REDIS_HOST / PORT / PASS / NODE_ID
 
 Redis 一定要设密码，不要直接暴露在公网上。
 
-## 7. 常用命令速查
+## 8. 常用命令速查
 
 ### B 服务器 `ws-tunnel.sh`
 
@@ -209,7 +241,7 @@ wst shortcut ws     # B 服务器
 
 名字不能和系统已有命令重名（比如装了 PHP 的机器上 `php` 就不能用）。`update` 会同时更新脚本和程序。
 
-## 8. 文件位置
+## 9. 文件位置
 
 | 服务器 | 路径 | 内容 |
 |---|---|---|
@@ -219,22 +251,24 @@ wst shortcut ws     # B 服务器
 | B | `/etc/systemd/system/ws-tunnel.service` | 系统服务 |
 | A | `/usr/local/bin/ws-tunnel-client` | 程序 |
 | A | `/etc/ws-client/端口.conf` | 每个端口的配置 |
+| A | `/etc/ws-client/filter.conf` | 反探测拉黑配置（合法路径、白名单、Redis） |
+| A | `/etc/ws-client/blacklist.txt` | 拉黑文件（所有端口共用） |
 | A | `/etc/systemd/system/ws-client@.service` | 系统服务模板 |
 
 手动改了配置文件后，执行 `restart` 生效。
 
-## 9. 常见问题
+## 10. 常见问题
 
 **A 端日志出现“连接服务器失败”**
 - 检查 B 的服务是否在运行：`bash ws-tunnel.sh status`。
 - 检查安全组或防火墙有没有放行端口。
-- 检查 A 的 IP 是不是被拉黑了：在 B 上执行 `bash ws-tunnel.sh bans`。
+- 检查 A 的 IP 是不是被拉黑了：在 B 上执行 `bash ws-tunnel.sh bans`。A 和 B 的密码不一致时，B 会把 A 的 IP 拉黑，建议把 A 的 IP 加进 B 的白名单：`bash ws-tunnel.sh allow A_IP`。
 
 **A 端日志出现 `bad handshake`**
 - 路径或密码和 B 不一致。在 B 上执行 `bash ws-tunnel.sh ports` 核对配置。
 
 **自己被拉黑了**
-- 换一台机器登录 B，执行 `bash ws-tunnel.sh unban 你的IP`，再执行 `bash ws-tunnel.sh allow 你的IP` 加白名单。
+- 换一台机器登录 B，执行 `bash ws-tunnel.sh unban 你的IP`，再执行 `bash ws-tunnel.sh allow 你的IP` 加白名单。A 上同理：`bash ws-client.sh unban 你的IP`，再 `bash ws-client.sh filter` 选 1 填白名单。
 
 **下载失败**
 - 脚本会从 GitHub Releases 下载程序。如果服务器访问不了 GitHub，可以手动下载 `ws-tunnel-server-tcp-linux-amd64` 或 `ws-tunnel-client-linux-amd64`，和脚本放在同一个目录，再运行安装，脚本会优先使用本地文件。

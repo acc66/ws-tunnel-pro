@@ -5,8 +5,15 @@ package main
 //   B 端是旧版（不支持多路复用）时自动退回“一个连接一条 WebSocket”
 // - 备用服务器：-server 用逗号分隔多个地址，按顺序优先；当前服务器失败自动切到下一个，
 //   主服务器恢复后新连接自动切回
+// - 反探测拉黑（-path /mm 开启）：本地端口收到的首个 HTTP 请求路径不是 -path、或不是 HTTP 数据
+//   → 拉黑IP（追加到 -blacklist 文件）+ 返回 nginx 蜜罐页；黑名单IP连接时直接断开
+//   路径正确但不是 WebSocket → 只返回蜜罐页；非 HTTP 数据 → 断开（-ban-invalid 时也拉黑）
+//   拉黑文件每行一个IP（# 后为注释），被修改后 5 秒内自动重新加载，多个端口实例共用同一文件
+//   配置 -redis-host 后黑名单与 Redis bl:rank 共享（与 B 服务器 ws-tunnel-server-tcp 同结构，A/B 互通）
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,6 +21,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +48,18 @@ var (
 	checkEvery = flag.Duration("check", 10*time.Second, "故障服务器的探测间隔（恢复后自动切回）")
 	verbose    = flag.Bool("v", false, "输出每个连接的日志（连接数大时建议关闭）")
 	showVer    = flag.Bool("version", false, "显示版本号")
+
+	// 反探测拉黑（-path 为空则关闭，原样转发任何数据）
+	filterPath = flag.String("path", "", "合法 WebSocket 路径（如 /mm）；设置后路径不对即拉黑IP，留空关闭过滤（原样转发）")
+	blFile     = flag.String("blacklist", "/etc/ws-client/blacklist.txt", "本地拉黑文件（每行一个IP）")
+	allowList  = flag.String("allow", "", "永不拉黑的IP，逗号分隔（自己的测试IP等）")
+	noBan      = flag.Bool("no-ban", false, "只返回蜜罐页，不拉黑")
+	banInvalid = flag.Bool("ban-invalid", true, "非 HTTP 数据（GFW 随机字节探测等）也拉黑（ws-client-filter-v1）")
+	redisHost  = flag.String("redis-host", "", "共享 Redis 地址（留空则只用本地拉黑文件；与 B 服务器共用同一个库即共享黑名单）")
+	redisPort  = flag.String("redis-port", "6379", "Redis 端口")
+	redisPass  = flag.String("redis-pass", "", "Redis 密码")
+	nodeID     = flag.String("node", "", "节点标识（默认主机名）")
+	syncEvery  = flag.Duration("sync", 60*time.Second, "从 Redis 同步黑名单间隔")
 )
 
 const (
@@ -397,6 +420,31 @@ func main() {
 		log.Printf("🔀 多路复用: 关闭")
 	}
 
+	if *filterPath != "" {
+		bl = newBlacklist(*allowList)
+		if !*noBan {
+			if err := os.MkdirAll(filepath.Dir(*blFile), 0755); err != nil {
+				log.Printf("[WARN] 创建目录失败: %v", err)
+			}
+		}
+		bl.reloadFile(true)
+		go watchFile()
+		if *nodeID == "" {
+			*nodeID, _ = os.Hostname()
+		}
+		if *redisHost != "" && !*noBan {
+			go syncLoop()
+		}
+		switch {
+		case *noBan:
+			log.Printf("🛡️  反探测: 合法路径 %s，拉黑已关闭（仅蜜罐页）", *filterPath)
+		case *redisHost != "":
+			log.Printf("🛡️  反探测: 合法路径 %s，拉黑文件 %s + 共享 Redis %s:%s（节点 %s）", *filterPath, *blFile, *redisHost, *redisPort, *nodeID)
+		default:
+			log.Printf("🛡️  反探测: 合法路径 %s，拉黑文件 %s", *filterPath, *blFile)
+		}
+	}
+
 	listener, err := net.Listen("tcp", *localAddr)
 	if err != nil {
 		log.Fatal("监听失败:", err)
@@ -448,6 +496,16 @@ func handleConnection(localConn net.Conn) {
 		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
+	// 反探测过滤：先读首个请求头，不合法就拉黑 / 返回蜜罐，合法才建隧道
+	var src io.ReadWriteCloser = localConn
+	var head []byte
+	if *filterPath != "" {
+		var ok bool
+		if head, src, ok = filterRequest(localConn); !ok {
+			return
+		}
+	}
+
 	tunnel, u, err := openTunnel()
 	if err != nil {
 		log.Printf("❌ 连接服务器失败: %v", err)
@@ -456,7 +514,13 @@ func handleConnection(localConn net.Conn) {
 	defer tunnel.Close()
 	vlog("🔗 %s → %s", localConn.RemoteAddr(), u.url)
 
-	pipe(localConn, tunnel)
+	// 回放已读的请求头（缓冲区里剩余的数据由 src 继续读出）
+	if len(head) > 0 {
+		if _, err := tunnel.Write(head); err != nil {
+			return
+		}
+	}
+	pipe(src, tunnel)
 	vlog("🔌 连接关闭: %s", localConn.RemoteAddr())
 }
 
@@ -475,4 +539,423 @@ func pipe(a, b io.ReadWriteCloser) {
 	go cp(b, a)
 	<-done
 	<-done
+}
+
+// ==================== 反探测拉黑 ====================
+
+const (
+	headerTimeout = 10 * time.Second
+	maxHeaderSize = 16 * 1024
+
+	honeypotHTML = `<!DOCTYPE html><html><head><title>Welcome to nginx!</title><style>body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p><p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.</p><p><em>Thank you for using nginx.</em></p></body></html>`
+)
+
+var bl *blacklist
+
+type blacklist struct {
+	mu      sync.RWMutex
+	ips     map[string]struct{} // 本地拉黑文件中的
+	remote  map[string]struct{} // Redis 中的
+	pending map[string]struct{} // 写 Redis 失败、待重试的
+	allow   map[string]struct{}
+
+	fmu     sync.Mutex // 串行化文件读写
+	modTime time.Time
+	size    int64
+}
+
+func newBlacklist(allow string) *blacklist {
+	b := &blacklist{ips: map[string]struct{}{}, remote: map[string]struct{}{}, pending: map[string]struct{}{}, allow: map[string]struct{}{}}
+	for _, ip := range strings.Split(allow, ",") {
+		if ip = strings.TrimSpace(ip); ip != "" {
+			b.allow[normalizeIP(ip)] = struct{}{}
+		}
+	}
+	return b
+}
+
+func (b *blacklist) has(ip string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if _, ok := b.allow[ip]; ok {
+		return false
+	}
+	if _, ok := b.ips[ip]; ok {
+		return true
+	}
+	_, ok := b.remote[ip]
+	return ok
+}
+
+func (b *blacklist) markPending(ip string, failed bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if failed {
+		b.pending[ip] = struct{}{}
+	} else {
+		delete(b.pending, ip)
+	}
+}
+
+func (b *blacklist) pendingList() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make([]string, 0, len(b.pending))
+	for ip := range b.pending {
+		out = append(out, ip)
+	}
+	return out
+}
+
+// replaceRemote 用 Redis 数据整体替换（Redis 中删除的IP即视为解封，本地文件中的不受影响）
+func (b *blacklist) replaceRemote(redisIPs []string) int {
+	next := make(map[string]struct{}, len(redisIPs))
+	for _, ip := range redisIPs {
+		next[normalizeIP(ip)] = struct{}{}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.remote = next
+	return len(next)
+}
+
+// add 返回 true 表示是新拉黑的IP（已追加到拉黑文件）
+func (b *blacklist) add(ip, reason string) bool {
+	b.mu.Lock()
+	if _, ok := b.allow[ip]; ok {
+		b.mu.Unlock()
+		return false
+	}
+	if _, ok := b.ips[ip]; ok {
+		b.mu.Unlock()
+		return false
+	}
+	b.ips[ip] = struct{}{}
+	b.mu.Unlock()
+
+	b.fmu.Lock()
+	defer b.fmu.Unlock()
+	f, err := os.OpenFile(*blFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("[WARN] 写入拉黑文件失败: %v", err)
+		return true
+	}
+	// 注释里不能带换行，避免请求里的特殊字符破坏文件格式
+	reason = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, reason)
+	if len(reason) > 120 {
+		reason = reason[:120]
+	}
+	fmt.Fprintf(f, "%s # %s %s\n", ip, time.Now().Format("2006-01-02 15:04:05"), reason)
+	f.Close()
+	if st, err := os.Stat(*blFile); err == nil {
+		b.modTime, b.size = st.ModTime(), st.Size() // 自己写的不触发重载
+	}
+	return true
+}
+
+// reloadFile 文件被外部修改（手动删行解封 / 手动加IP / 其他端口实例拉黑）时重新加载
+func (b *blacklist) reloadFile(force bool) {
+	b.fmu.Lock()
+	defer b.fmu.Unlock()
+	st, err := os.Stat(*blFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			b.mu.Lock()
+			n := len(b.ips)
+			b.ips = map[string]struct{}{}
+			b.mu.Unlock()
+			if n > 0 {
+				log.Printf("拉黑文件已删除，黑名单清空")
+			}
+			b.modTime, b.size = time.Time{}, 0
+		}
+		return
+	}
+	if !force && st.ModTime().Equal(b.modTime) && st.Size() == b.size {
+		return
+	}
+	f, err := os.Open(*blFile)
+	if err != nil {
+		log.Printf("[WARN] 读取拉黑文件失败: %v", err)
+		return
+	}
+	defer f.Close()
+	next := map[string]struct{}{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line, _, _ := strings.Cut(sc.Text(), "#")
+		if fields := strings.Fields(line); len(fields) > 0 {
+			next[normalizeIP(fields[0])] = struct{}{}
+		}
+	}
+	b.mu.Lock()
+	b.ips = next
+	b.mu.Unlock()
+	b.modTime, b.size = st.ModTime(), st.Size()
+	log.Printf("已加载拉黑文件 %s，共 %d 个IP", *blFile, len(next))
+}
+
+func watchFile() {
+	for {
+		time.Sleep(5 * time.Second)
+		bl.reloadFile(false)
+	}
+}
+
+func normalizeIP(s string) string {
+	ip := net.ParseIP(strings.TrimSpace(s))
+	if ip == nil {
+		return strings.TrimSpace(s)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.String()
+}
+
+func remoteIP(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return normalizeIP(host)
+}
+
+func ban(ip, reason string) {
+	if *noBan || !bl.add(ip, reason) {
+		return
+	}
+	log.Printf("🚫 拉黑 %s（%s）", ip, reason)
+	if *redisHost == "" {
+		return
+	}
+	go func() {
+		if err := redisBan(ip); err != nil {
+			log.Printf("[WARN] 写入 Redis 失败 %s: %v（稍后重试）", ip, err)
+			bl.markPending(ip, true)
+		}
+	}()
+}
+
+// ==================== 极简 Redis 客户端（RESP，无第三方依赖，与 B 服务器相同） ====================
+
+const (
+	redisTimeout = 3 * time.Second
+
+	// 与 ws-tunnel-server-tcp.go 保持一致：bl:<ip> 记录详情，bl:rank 按触发次数排序
+	banLua = `local ip=ARGV[1] local node=ARGV[2] local ts=ARGV[3] local key="bl:"..ip local count=redis.call("HINCRBY",key,"count",1) redis.call("HSET",key,"ip",ip,"node",node,"last",ts) if count==1 then redis.call("HSET",key,"first",ts) end redis.call("ZADD","bl:rank",count,ip) return count`
+)
+
+func redisDo(args ...string) (interface{}, error) {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(*redisHost, *redisPort), redisTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(redisTimeout * 3))
+	r := bufio.NewReader(conn)
+	if *redisPass != "" {
+		if _, err := redisCmd(conn, r, "AUTH", *redisPass); err != nil {
+			return nil, fmt.Errorf("AUTH: %w", err)
+		}
+	}
+	return redisCmd(conn, r, args...)
+}
+
+func redisCmd(w io.Writer, r *bufio.Reader, args ...string) (interface{}, error) {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "*%d\r\n", len(args))
+	for _, a := range args {
+		fmt.Fprintf(&buf, "$%d\r\n%s\r\n", len(a), a)
+	}
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		return nil, err
+	}
+	return readRESP(r)
+}
+
+func readRESP(r *bufio.Reader) (interface{}, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	line = strings.TrimRight(line, "\r\n")
+	if line == "" {
+		return nil, errors.New("redis: 空响应")
+	}
+	switch line[0] {
+	case '+':
+		return line[1:], nil
+	case '-':
+		return nil, errors.New("redis: " + line[1:])
+	case ':':
+		return strconv.ParseInt(line[1:], 10, 64)
+	case '$':
+		n, err := strconv.Atoi(line[1:])
+		if err != nil || n < 0 {
+			return nil, err
+		}
+		data := make([]byte, n+2)
+		if _, err := io.ReadFull(r, data); err != nil {
+			return nil, err
+		}
+		return string(data[:n]), nil
+	case '*':
+		n, err := strconv.Atoi(line[1:])
+		if err != nil || n < 0 {
+			return nil, err
+		}
+		arr := make([]interface{}, 0, n)
+		for i := 0; i < n; i++ {
+			v, err := readRESP(r)
+			if err != nil {
+				return nil, err
+			}
+			arr = append(arr, v)
+		}
+		return arr, nil
+	}
+	return nil, fmt.Errorf("redis: 未知响应 %q", line)
+}
+
+func redisBan(ip string) error {
+	_, err := redisDo("EVAL", banLua, "0", ip, *nodeID, strconv.FormatInt(time.Now().Unix(), 10))
+	return err
+}
+
+func redisFetchAll() ([]string, error) {
+	v, err := redisDo("ZRANGE", "bl:rank", "0", "-1")
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil, errors.New("redis: ZRANGE 返回类型错误")
+	}
+	out := make([]string, 0, len(arr))
+	for _, x := range arr {
+		if s, ok := x.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+// syncLoop 补写失败的拉黑记录，并定期拉取共享黑名单
+func syncLoop() {
+	var last = -1
+	for {
+		for _, ip := range bl.pendingList() {
+			if err := redisBan(ip); err == nil {
+				bl.markPending(ip, false)
+			}
+		}
+		if ips, err := redisFetchAll(); err != nil {
+			log.Printf("[WARN] Redis 同步失败: %v（继续使用本地拉黑文件）", err)
+			last = -1
+		} else if n := bl.replaceRemote(ips); n != last {
+			// 只在数量变化时输出，避免每分钟刷日志
+			log.Printf("Redis 同步完成，共享黑名单 %d 个IP", n)
+			last = n
+		}
+		time.Sleep(*syncEvery)
+	}
+}
+
+func writeFakePage(c net.Conn) {
+	c.SetWriteDeadline(time.Now().Add(headerTimeout))
+	fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nServer: nginx/1.18.0\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		len(honeypotHTML), honeypotHTML)
+}
+
+// readHeader 读取首个 HTTP 请求头（到空行），返回已读字节（转发时原样回放）
+func readHeader(r *bufio.Reader) ([]byte, error) {
+	var buf bytes.Buffer
+	for {
+		line, err := r.ReadSlice('\n')
+		buf.Write(line)
+		if err != nil && err != bufio.ErrBufferFull {
+			return buf.Bytes(), err
+		}
+		if buf.Len() > maxHeaderSize {
+			return buf.Bytes(), errors.New("请求头过大")
+		}
+		if err == nil && (len(line) == 2 && line[0] == '\r' || len(line) == 1) {
+			return buf.Bytes(), nil
+		}
+	}
+}
+
+// parseRequest 解析请求行和 Upgrade 头
+func parseRequest(head []byte) (method, path string, isWS, ok bool) {
+	lines := strings.Split(string(head), "\n")
+	parts := strings.Fields(lines[0])
+	if len(parts) != 3 || !strings.HasPrefix(parts[2], "HTTP/") {
+		return "", "", false, false
+	}
+	method, path = parts[0], parts[1]
+	if u, err := url.ParseRequestURI(path); err == nil {
+		path = u.Path // 去掉 ?query
+	}
+	for _, l := range lines[1:] {
+		k, v, found := strings.Cut(l, ":")
+		if found && strings.EqualFold(strings.TrimSpace(k), "Upgrade") &&
+			strings.EqualFold(strings.TrimSpace(v), "websocket") {
+			isWS = true
+		}
+	}
+	return method, path, isWS, true
+}
+
+// bufConn 先读完 bufio 里已缓冲的数据，再读底层连接
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// filterRequest 检查首个请求；ok=false 表示已拒绝（调用方直接关闭连接）
+func filterRequest(c net.Conn) (head []byte, src io.ReadWriteCloser, ok bool) {
+	ip := remoteIP(c.RemoteAddr().String())
+	if bl.has(ip) {
+		vlog("⛔ 黑名单IP断开: %s", ip)
+		return nil, nil, false
+	}
+
+	c.SetReadDeadline(time.Now().Add(headerTimeout))
+	r := bufio.NewReaderSize(c, 4096)
+	head, err := readHeader(r)
+	if err != nil {
+		// 超时/断开/请求头过大：不转发；收到过数据但不是完整 HTTP 头视为探测
+		if *banInvalid && len(head) > 0 {
+			ban(ip, "非HTTP数据")
+		}
+		return nil, nil, false
+	}
+	c.SetReadDeadline(time.Time{})
+
+	method, path, isWS, valid := parseRequest(head)
+	switch {
+	case !valid:
+		if *banInvalid {
+			ban(ip, "非法请求行")
+		}
+		return nil, nil, false
+	case path != *filterPath:
+		log.Printf("🕵️  非法访问: %s %s %s", c.RemoteAddr(), method, path)
+		ban(ip, method+" "+path)
+		writeFakePage(c)
+		return nil, nil, false
+	case !isWS:
+		// 路径正确但不是 WebSocket：只给蜜罐，不拉黑（客户端可能先发普通探测）
+		writeFakePage(c)
+		return nil, nil, false
+	}
+	return head, &bufConn{Conn: c, r: r}, true
 }
