@@ -10,7 +10,7 @@
 #                         name 进程名      # 自定义进程名（- 恢复默认）
 #================================================================
 
-SCRIPT_VER="v1.6.1"
+SCRIPT_VER="v1.6.2"
 REPO="acc66/ws-tunnel-pro"
 SCRIPT_NAME="ws-tunnel.sh"
 SHORT_DEFAULT="wst"
@@ -255,7 +255,7 @@ do_redis() {
 do_install() {
     command -v curl >/dev/null || { apt-get install -y curl 2>/dev/null || yum install -y curl; }
     load_conf
-    read -rp "目标地址 ip:port 或 unix:/路径 [${TARGET:-无}]: " t; [ -n "$t" ] && TARGET="$t"
+    read -rp "目标地址 ip:port 或 unix:/路径，多个用逗号分隔（按顺序故障切换）[${TARGET:-无}]: " t; [ -n "$t" ] && TARGET="$t"
     [ -z "$TARGET" ] && { red "必须填写目标地址"; exit 1; }
     read -rp "监听端口(逗号分隔) [${LISTEN//:/}]: " p
     if [ -n "$p" ]; then
@@ -320,7 +320,7 @@ do_delport() {
 
 do_target() {
     load_conf
-    local t="$1"; [ -z "$t" ] && read -rp "新的目标地址 ip:port 或 unix:/路径: " t
+    local t="$1"; [ -z "$t" ] && read -rp "新的目标地址（多个用逗号分隔，按顺序故障切换）: " t
     [ -z "$t" ] && return 1
     TARGET="$t"; save_conf; systemctl restart "$SERVICE"; green "已改为转发到 $TARGET"
 }

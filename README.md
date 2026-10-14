@@ -249,9 +249,11 @@ wst shortcut ws     # B 服务器
 - 日志里每分钟一条 `📊`，带当前连接数和内存占用。
 - B 和 HAProxy 在同一台机器时，可以改走 Unix socket，跳过本机回环 TCP 协议栈，省一部分内核 CPU：
   1. 在 HAProxy 接收 B 流量的 frontend（比如 `mmk`）加一行 `bind unix@/run/haproxy-ws.sock mode 666`，执行 `haproxy -c -f /etc/haproxy/haproxy.cfg && systemctl reload haproxy`。
-  2. B 上执行 `wst target unix:/run/haproxy-ws.sock`。
+  2. B 上执行 `wst target unix:/run/haproxy-ws.sock,127.0.0.1:20001`。逗号后面是备用：socket 连不上（比如 HAProxy restart 的那几秒）会自动改走 TCP 20001，5 秒后再试 socket。
   3. 改回来：`wst target 127.0.0.1:20001`。
 - 密码通过环境变量传给程序，`ps` 里看不到。升级后执行一次 `update`，服务文件会自动更新。
+- 改 HAProxy 配置后用 `systemctl reload haproxy`，不要用 `restart`。reload 是无缝切换，restart 中间会有几秒没人监听。
+- 连接目标失败时，日志每 10 秒汇总一条，不会刷屏。
 
 ## 10. 文件位置
 

@@ -38,7 +38,7 @@ var version = "dev"
 var (
 	listenAddr = flag.String("listen", ":8080", "WebSocket 监听地址，多个用逗号分隔")
 	wsPath     = flag.String("path", "/mm", "WebSocket 路径")
-	targetAddr = flag.String("target", "xjpk1.help600.com:2086", "目标服务器地址 ip:port，或 unix:/路径（本机 HAProxy 用 Unix socket 更省 CPU）")
+	targetAddr = flag.String("target", "xjpk1.help600.com:2086", "目标地址 ip:port 或 unix:/路径，多个用逗号分隔（按顺序故障切换，如 unix:/run/haproxy-ws.sock,127.0.0.1:20001）")
 	password   = flag.String("password", "your_secret_password", "连接密码（也可用环境变量 WS_PASSWORD，ws-env-password-v1）")
 
 	blFile    = flag.String("blacklist", "/etc/ws-tunnel/blacklist.txt", "本地拉黑文件（每行一个IP）")
@@ -463,7 +463,12 @@ func main() {
 
 	log.Printf("🚀 WebSocket TCP 隧道服务器启动 %s", version)
 	log.Printf("🔑 WebSocket 路径: %s", *wsPath)
+	targets = parseTargets(*targetAddr)
+	if len(targets) == 0 {
+		log.Fatal("未配置目标地址 -target")
+	}
 	log.Printf("🎯 目标地址: %s", *targetAddr)
+	go dialFailLoop()
 	switch {
 	case *noBan:
 		log.Printf("🛡️  拉黑已关闭")
@@ -558,12 +563,85 @@ func handleWebSocketTunnel(w http.ResponseWriter, r *http.Request) {
 	vlog("🔌 复用连接关闭: %s", r.RemoteAddr)
 }
 
-// dialTarget 连接目标：unix:/path 走 Unix socket（绕开本机回环 TCP 协议栈），否则 TCP
-func dialTarget() (net.Conn, error) {
-	if p, ok := strings.CutPrefix(*targetAddr, "unix:"); ok {
-		return net.DialTimeout("unix", p, 10*time.Second)
+// ==================== 目标（可多个，按顺序故障切换） ====================
+
+// target 一个目标地址；down 后 targetRetry 内跳过（直接用下一个），到期再试
+type target struct {
+	network, addr, raw string
+	downUntil          atomic.Int64 // UnixNano，0 表示正常
+}
+
+const targetRetry = 5 * time.Second
+
+var targets []*target
+
+func parseTargets(s string) []*target {
+	var out []*target
+	for _, a := range strings.Split(s, ",") {
+		if a = strings.TrimSpace(a); a == "" {
+			continue
+		}
+		t := &target{network: "tcp", addr: a, raw: a}
+		if p, ok := strings.CutPrefix(a, "unix:"); ok {
+			t.network, t.addr = "unix", p
+		}
+		out = append(out, t)
 	}
-	return net.DialTimeout("tcp", *targetAddr, 10*time.Second)
+	return out
+}
+
+func (t *target) dial() (net.Conn, error) {
+	timeout := 10 * time.Second
+	if t.network == "unix" {
+		timeout = 2 * time.Second // 本机 socket：连不上就是没在监听，不必等
+	}
+	return net.DialTimeout(t.network, t.addr, timeout)
+}
+
+// dialTarget 按顺序连接目标：unix:/path 走 Unix socket（绕开本机回环 TCP 协议栈），否则 TCP。
+// 失败的目标标记为故障，targetRetry 内直接用下一个；全部故障时仍逐个硬试
+func dialTarget() (net.Conn, error) {
+	var lastErr error
+	now := time.Now().UnixNano()
+	for pass := 0; pass < 2; pass++ {
+		for i, t := range targets {
+			down := t.downUntil.Load() > now
+			if down != (pass == 1) {
+				continue
+			}
+			c, err := t.dial()
+			if err == nil {
+				if t.downUntil.Swap(0) != 0 {
+					log.Printf("✅ 目标恢复: %s", t.raw)
+				}
+				return c, nil
+			}
+			lastErr = err
+			if t.downUntil.Swap(time.Now().Add(targetRetry).UnixNano()) == 0 && len(targets) > 1 {
+				next := "无"
+				if i+1 < len(targets) {
+					next = targets[i+1].raw
+				}
+				log.Printf("⚠️  目标故障 %s: %v（切换到 %s，%v 后重试）", t.raw, err, next, targetRetry)
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+// dialFails 连接目标失败的计数，每 10 秒汇总输出一次，避免故障时每个连接刷一行日志
+var (
+	dialFails   atomic.Int64
+	dialLastErr atomic.Value
+)
+
+func dialFailLoop() {
+	for {
+		time.Sleep(10 * time.Second)
+		if n := dialFails.Swap(0); n > 0 {
+			log.Printf("❌ 10 秒内连接目标失败 %d 次（%s）: %v", n, *targetAddr, dialLastErr.Load())
+		}
+	}
 }
 
 // forward 连接目标并双向转发，任意一端结束即关闭两端
@@ -573,7 +651,8 @@ func forward(c io.ReadWriteCloser) {
 
 	tcpConn, err := dialTarget()
 	if err != nil {
-		log.Printf("❌ 连接目标失败 %s: %v", *targetAddr, err)
+		dialFails.Add(1)
+		dialLastErr.Store(err.Error())
 		return
 	}
 	if tc, ok := tcpConn.(*net.TCPConn); ok {
