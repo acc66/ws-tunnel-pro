@@ -14,7 +14,7 @@
 #                         bans | ban IP | unban IP | banlog | clearbans
 #================================================================
 
-SCRIPT_VER="v1.6.0"
+SCRIPT_VER="v1.6.1"
 REPO="acc66/ws-tunnel-pro"
 SCRIPT_NAME="ws-client.sh"
 SHORT_DEFAULT="wsc"
@@ -143,7 +143,17 @@ mem_limit() {
     [ -n "$kb" ] && [ "$kb" -gt 0 ] && echo "$((kb * $1 / 100 / 1024))MiB" || echo "off"
 }
 
+# 新版程序（含 ws-env-password-v1）从环境变量读密码，不出现在 ps 里；旧版程序仍用命令行参数
+pw_args() {
+    if [ -x "$BIN" ] && grep -q "ws-env-password-v1" "$BIN" 2>/dev/null; then
+        PW_PRE='WS_PASSWORD="$PASSWORD" WS_REDIS_PASS="$REDIS_PASS" '; PW_ARG=''
+    else
+        PW_PRE=''; PW_ARG='-password "$PASSWORD" -redis-pass "$REDIS_PASS" '
+    fi
+}
+
 write_unit() {
+    pw_args
     cat > "$UNIT" <<EOF
 [Unit]
 Description=ws-tunnel client on port %i
@@ -157,7 +167,7 @@ Environment=GOMEMLIMIT=$(mem_limit 30)
 EnvironmentFile=$CONF_DIR/%i.conf
 # 反探测拉黑配置（所有端口共用，文件不存在则关闭过滤）
 EnvironmentFile=-$FILTER_CONF
-ExecStart=/bin/sh -c 'exec $BIN -local "\$BIND:%i" -server "\$SERVER" -password "\$PASSWORD" -path "\$FPATH" -blacklist $BLFILE -allow "\$FALLOW" -redis-host "\$REDIS_HOST" -redis-port "\${REDIS_PORT:-6379}" -redis-pass "\$REDIS_PASS" -node "\$NODE_ID" \$EXTRA'
+ExecStart=/bin/sh -c '${PW_PRE}exec $BIN ${PW_ARG}-local "\$BIND:%i" -server "\$SERVER" -path "\$FPATH" -blacklist $BLFILE -allow "\$FALLOW" -redis-host "\$REDIS_HOST" -redis-port "\${REDIS_PORT:-6379}" -node "\$NODE_ID" \$EXTRA'
 Restart=always
 RestartSec=3
 LimitNOFILE=1000000
@@ -217,6 +227,7 @@ ensure_new_bin() {
     [ -x "$BIN" ] && grep -q "ws-client-filter-v1" "$BIN" && return
     yellow "当前程序是旧版，不支持拉黑/备用服务器，先更新程序..."
     download_bin
+    write_unit
 }
 
 do_add() {

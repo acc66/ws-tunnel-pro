@@ -247,6 +247,11 @@ wst shortcut ws     # B 服务器
 - 程序启动时设置了 `GOMEMLIMIT`：B 按物理内存的 70%，A 每个端口按 30%。快到这个数时 GC 会回收得更积极，但它不是硬上限，不会因此杀进程。要手动指定，在配置文件（B 是 `/etc/ws-tunnel/ws-tunnel.conf`，A 是 `/etc/ws-client/端口.conf`）里加一行 `GOMEMLIMIT="1GiB"`。
 - B 的服务排在 haproxy 之后启动，开机时不会刷"连接目标失败"。
 - 日志里每分钟一条 `📊`，带当前连接数和内存占用。
+- B 和 HAProxy 在同一台机器时，可以改走 Unix socket，跳过本机回环 TCP 协议栈，省一部分内核 CPU：
+  1. 在 HAProxy 接收 B 流量的 frontend（比如 `mmk`）加一行 `bind unix@/run/haproxy-ws.sock mode 666`，执行 `haproxy -c -f /etc/haproxy/haproxy.cfg && systemctl reload haproxy`。
+  2. B 上执行 `wst target unix:/run/haproxy-ws.sock`。
+  3. 改回来：`wst target 127.0.0.1:20001`。
+- 密码通过环境变量传给程序，`ps` 里看不到。升级后执行一次 `update`，服务文件会自动更新。
 
 ## 10. 文件位置
 

@@ -42,7 +42,7 @@ var (
 	// 命令行参数
 	localAddr  = flag.String("local", "127.0.0.1:1080", "本地监听地址")
 	serverAddr = flag.String("server", "ws://2.2.2.2:8080/mm", "WebSocket 服务器地址，多个用逗号分隔（第一个为主，其余为备用）")
-	password   = flag.String("password", "your_secret_password", "连接密码")
+	password   = flag.String("password", "your_secret_password", "连接密码（也可用环境变量 WS_PASSWORD，ws-env-password-v1）")
 	useTLS     = flag.Bool("tls", false, "使用 WSS (TLS)")
 	muxConns   = flag.Int("mux", 4, "每个服务器至少复用的 WebSocket 连接数（0=关闭多路复用，每个连接单独一条 WebSocket）")
 	muxStreams = flag.Int("mux-streams", 128, "每条复用 WebSocket 最多承载的连接数，超过自动新开（0=不限）")
@@ -337,15 +337,46 @@ func openTunnel() (io.ReadWriteCloser, *upstream, error) {
 	return nil, nil, lastErr
 }
 
+// muxRecheck 服务端曾不支持多路复用时，隔这么久重新探测一次（B 升级后不用重启 A 就能切回复用）
+const muxRecheck = 5 * time.Minute
+
 func checkLoop() {
+	lastMuxCheck := time.Now()
 	for {
 		time.Sleep(*checkEvery)
+		recheck := time.Since(lastMuxCheck) >= muxRecheck
+		if recheck {
+			lastMuxCheck = time.Now()
+		}
 		for _, u := range upstreams {
 			if u.isDown() {
 				go u.probe()
+			} else if recheck && *muxConns > 0 && u.noMuxNow() {
+				go u.recheckMux()
 			}
 			u.trimSlots()
 		}
+	}
+}
+
+func (u *upstream) noMuxNow() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.noMux
+}
+
+// recheckMux 重新探测服务端是否已支持多路复用
+func (u *upstream) recheckMux() {
+	ws, ok, err := u.dialWS(true)
+	if err != nil {
+		return
+	}
+	ws.Close()
+	if ok {
+		u.mu.Lock()
+		u.noMux = false
+		u.mu.Unlock()
+		log.Printf("✅ %s 已支持多路复用，切回复用模式", u.url)
 	}
 }
 
@@ -386,13 +417,19 @@ func (u *upstream) trimSlots() {
 
 // wsConn 把 WebSocket 包装成字节流：每次 Write 一个二进制消息，Read 流式读取消息体（不整条分配内存）
 // 带 ping/pong 心跳和读超时，对端掉线（断电、NAT 超时）时能及时回收连接
+// 读写超时每秒最多刷新一次：每条消息都设 deadline 在高包速下是可观的开销
 type wsConn struct {
 	ws   *websocket.Conn
 	r    io.Reader
 	wm   sync.Mutex
 	once sync.Once
 	stop chan struct{}
+
+	rdl int64 // 上次设置读超时的时间（UnixNano），仅读协程访问
+	wdl int64 // 上次设置写超时的时间（UnixNano），持 wm 访问
 }
+
+const deadlineRefresh = int64(time.Second)
 
 func newWSConn(ws *websocket.Conn) *wsConn {
 	c := &wsConn{ws: ws, stop: make(chan struct{})}
@@ -423,7 +460,10 @@ func (c *wsConn) Read(p []byte) (int, error) {
 			if err != nil {
 				return 0, err
 			}
-			c.ws.SetReadDeadline(time.Now().Add(idleTimeout))
+			if now := time.Now(); now.UnixNano()-c.rdl >= deadlineRefresh {
+				c.ws.SetReadDeadline(now.Add(idleTimeout))
+				c.rdl = now.UnixNano()
+			}
 			if t != websocket.BinaryMessage {
 				continue
 			}
@@ -444,7 +484,10 @@ func (c *wsConn) Read(p []byte) (int, error) {
 func (c *wsConn) Write(p []byte) (int, error) {
 	c.wm.Lock()
 	defer c.wm.Unlock()
-	c.ws.SetWriteDeadline(time.Now().Add(idleTimeout))
+	if now := time.Now(); now.UnixNano()-c.wdl >= deadlineRefresh {
+		c.ws.SetWriteDeadline(now.Add(idleTimeout))
+		c.wdl = now.UnixNano()
+	}
 	if err := c.ws.WriteMessage(websocket.BinaryMessage, p); err != nil {
 		return 0, err
 	}
@@ -458,8 +501,20 @@ func (c *wsConn) Close() error {
 
 // ==================== 主流程 ====================
 
+// envDefaults 命令行没给的参数从环境变量取（systemd 用 EnvironmentFile 传入，密码不出现在 ps 里）
+func envDefaults(m map[string]string) {
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	for name, env := range m {
+		if v, ok := os.LookupEnv(env); ok && !set[name] {
+			flag.Set(name, v)
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
+	envDefaults(map[string]string{"password": "WS_PASSWORD", "redis-pass": "WS_REDIS_PASS"})
 	if *showVer {
 		fmt.Println(version)
 		return
@@ -605,17 +660,16 @@ func handleConnection(localConn net.Conn) {
 }
 
 // pipe 双向转发，任意一端结束即关闭两端
+// 一个方向在本协程里跑，每条连接省一个 goroutine
 func pipe(a, b io.ReadWriteCloser) {
-	done := make(chan struct{}, 2)
 	cp := func(dst, src io.ReadWriteCloser) {
 		copyStream(dst, src)
 		dst.Close()
 		src.Close()
-		done <- struct{}{}
 	}
-	go cp(a, b)
-	go cp(b, a)
-	<-done
+	done := make(chan struct{})
+	go func() { cp(a, b); close(done) }()
+	cp(b, a)
 	<-done
 }
 

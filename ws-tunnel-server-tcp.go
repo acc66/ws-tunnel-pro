@@ -38,8 +38,8 @@ var version = "dev"
 var (
 	listenAddr = flag.String("listen", ":8080", "WebSocket 监听地址，多个用逗号分隔")
 	wsPath     = flag.String("path", "/mm", "WebSocket 路径")
-	targetAddr = flag.String("target", "xjpk1.help600.com:2086", "目标服务器地址")
-	password   = flag.String("password", "your_secret_password", "连接密码")
+	targetAddr = flag.String("target", "xjpk1.help600.com:2086", "目标服务器地址 ip:port，或 unix:/路径（本机 HAProxy 用 Unix socket 更省 CPU）")
+	password   = flag.String("password", "your_secret_password", "连接密码（也可用环境变量 WS_PASSWORD，ws-env-password-v1）")
 
 	blFile    = flag.String("blacklist", "/etc/ws-tunnel/blacklist.txt", "本地拉黑文件（每行一个IP）")
 	redisHost = flag.String("redis-host", "", "共享 Redis 地址（留空则只用本地拉黑文件）")
@@ -423,8 +423,20 @@ func (l filterListener) Accept() (net.Conn, error) {
 	}
 }
 
+// envDefaults 命令行没给的参数从环境变量取（systemd 用 EnvironmentFile 传入，密码不出现在 ps 里）
+func envDefaults(m map[string]string) {
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	for name, env := range m {
+		if v, ok := os.LookupEnv(env); ok && !set[name] {
+			flag.Set(name, v)
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
+	envDefaults(map[string]string{"password": "WS_PASSWORD", "redis-pass": "WS_REDIS_PASS"})
 	if *showVer {
 		fmt.Println(version)
 		return
@@ -546,12 +558,20 @@ func handleWebSocketTunnel(w http.ResponseWriter, r *http.Request) {
 	vlog("🔌 复用连接关闭: %s", r.RemoteAddr)
 }
 
+// dialTarget 连接目标：unix:/path 走 Unix socket（绕开本机回环 TCP 协议栈），否则 TCP
+func dialTarget() (net.Conn, error) {
+	if p, ok := strings.CutPrefix(*targetAddr, "unix:"); ok {
+		return net.DialTimeout("unix", p, 10*time.Second)
+	}
+	return net.DialTimeout("tcp", *targetAddr, 10*time.Second)
+}
+
 // forward 连接目标并双向转发，任意一端结束即关闭两端
 func forward(c io.ReadWriteCloser) {
 	atomic.AddInt64(&streamCount, 1)
 	defer atomic.AddInt64(&streamCount, -1)
 
-	tcpConn, err := net.DialTimeout("tcp", *targetAddr, 10*time.Second)
+	tcpConn, err := dialTarget()
 	if err != nil {
 		log.Printf("❌ 连接目标失败 %s: %v", *targetAddr, err)
 		return
@@ -561,7 +581,7 @@ func forward(c io.ReadWriteCloser) {
 		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	done := make(chan struct{}, 2)
+	// 一个方向在本协程里跑，每条流省一个 goroutine（栈 8KB 起）
 	cp := func(dst, src io.ReadWriteCloser) {
 		_, err := copyStream(dst, src)
 		if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
@@ -569,11 +589,10 @@ func forward(c io.ReadWriteCloser) {
 		}
 		dst.Close()
 		src.Close()
-		done <- struct{}{}
 	}
-	go cp(tcpConn, c)
-	go cp(c, tcpConn)
-	<-done
+	done := make(chan struct{})
+	go func() { cp(tcpConn, c); close(done) }()
+	cp(c, tcpConn)
 	<-done
 }
 
@@ -614,13 +633,19 @@ func statsLoop() {
 
 // wsConn 把 WebSocket 包装成字节流：每次 Write 一个二进制消息，Read 流式读取消息体（不整条分配内存）
 // 带 ping/pong 心跳和读超时，对端掉线（断电、NAT 超时）时能及时回收连接
+// 读写超时每秒最多刷新一次：每条消息都设 deadline 在高包速下是可观的开销
 type wsConn struct {
 	ws   *websocket.Conn
 	r    io.Reader
 	wm   sync.Mutex
 	once sync.Once
 	stop chan struct{}
+
+	rdl int64 // 上次设置读超时的时间（UnixNano），仅读协程访问
+	wdl int64 // 上次设置写超时的时间（UnixNano），持 wm 访问
 }
+
+const deadlineRefresh = int64(time.Second)
 
 func newWSConn(ws *websocket.Conn) *wsConn {
 	c := &wsConn{ws: ws, stop: make(chan struct{})}
@@ -651,7 +676,10 @@ func (c *wsConn) Read(p []byte) (int, error) {
 			if err != nil {
 				return 0, err
 			}
-			c.ws.SetReadDeadline(time.Now().Add(idleTimeout))
+			if now := time.Now(); now.UnixNano()-c.rdl >= deadlineRefresh {
+				c.ws.SetReadDeadline(now.Add(idleTimeout))
+				c.rdl = now.UnixNano()
+			}
 			if t != websocket.BinaryMessage {
 				continue
 			}
@@ -672,7 +700,10 @@ func (c *wsConn) Read(p []byte) (int, error) {
 func (c *wsConn) Write(p []byte) (int, error) {
 	c.wm.Lock()
 	defer c.wm.Unlock()
-	c.ws.SetWriteDeadline(time.Now().Add(idleTimeout))
+	if now := time.Now(); now.UnixNano()-c.wdl >= deadlineRefresh {
+		c.ws.SetWriteDeadline(now.Add(idleTimeout))
+		c.wdl = now.UnixNano()
+	}
 	if err := c.ws.WriteMessage(websocket.BinaryMessage, p); err != nil {
 		return 0, err
 	}

@@ -10,7 +10,7 @@
 #                         name 进程名      # 自定义进程名（- 恢复默认）
 #================================================================
 
-SCRIPT_VER="v1.6.0"
+SCRIPT_VER="v1.6.1"
 REPO="acc66/ws-tunnel-pro"
 SCRIPT_NAME="ws-tunnel.sh"
 SHORT_DEFAULT="wst"
@@ -154,7 +154,17 @@ mem_limit() {
     [ -n "$kb" ] && [ "$kb" -gt 0 ] && echo "$((kb * $1 / 100 / 1024))MiB" || echo "off"
 }
 
+# 新版程序（含 ws-env-password-v1）从环境变量读密码，不出现在 ps 里；旧版程序仍用命令行参数
+pw_args() {
+    if [ -x "$BIN" ] && grep -q "ws-env-password-v1" "$BIN" 2>/dev/null; then
+        PW_PRE='WS_PASSWORD="$PASSWORD" WS_REDIS_PASS="$REDIS_PASS" '; PW_ARG=''
+    else
+        PW_PRE=''; PW_ARG='-password "$PASSWORD" -redis-pass "$REDIS_PASS" '
+    fi
+}
+
 write_unit() {
+    pw_args
     cat > "$UNIT" <<EOF
 [Unit]
 Description=ws-tunnel WebSocket to TCP server with anti-probe blacklist
@@ -165,7 +175,7 @@ StartLimitIntervalSec=0
 [Service]
 Environment=GOMEMLIMIT=$(mem_limit 70)
 EnvironmentFile=$CONF
-ExecStart=/bin/sh -c 'exec $BIN -listen "\$LISTEN" -target "\$TARGET" -path "\$WSPATH" -password "\$PASSWORD" -allow "\$ALLOW" -blacklist $BLFILE -redis-host "\$REDIS_HOST" -redis-port "\$REDIS_PORT" -redis-pass "\$REDIS_PASS" -node "\$NODE_ID" \$EXTRA'
+ExecStart=/bin/sh -c '${PW_PRE}exec $BIN ${PW_ARG}-listen "\$LISTEN" -target "\$TARGET" -path "\$WSPATH" -allow "\$ALLOW" -blacklist $BLFILE -redis-host "\$REDIS_HOST" -redis-port "\$REDIS_PORT" -node "\$NODE_ID" \$EXTRA'
 Restart=always
 RestartSec=3
 LimitNOFILE=1000000
@@ -245,7 +255,7 @@ do_redis() {
 do_install() {
     command -v curl >/dev/null || { apt-get install -y curl 2>/dev/null || yum install -y curl; }
     load_conf
-    read -rp "目标地址 ip:port [${TARGET:-无}]: " t; [ -n "$t" ] && TARGET="$t"
+    read -rp "目标地址 ip:port 或 unix:/路径 [${TARGET:-无}]: " t; [ -n "$t" ] && TARGET="$t"
     [ -z "$TARGET" ] && { red "必须填写目标地址"; exit 1; }
     read -rp "监听端口(逗号分隔) [${LISTEN//:/}]: " p
     if [ -n "$p" ]; then
@@ -310,7 +320,7 @@ do_delport() {
 
 do_target() {
     load_conf
-    local t="$1"; [ -z "$t" ] && read -rp "新的目标地址 ip:port: " t
+    local t="$1"; [ -z "$t" ] && read -rp "新的目标地址 ip:port 或 unix:/路径: " t
     [ -z "$t" ] && return 1
     TARGET="$t"; save_conf; systemctl restart "$SERVICE"; green "已改为转发到 $TARGET"
 }
