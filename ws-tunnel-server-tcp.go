@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,7 +80,7 @@ var upgrader = websocket.Upgrader{
 }
 
 var (
-	bufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
+	bufPool = sync.Pool{New: func() any { b := make([]byte, 16*1024); return &b }} // 只给 TCP→隧道 方向用
 
 	wsCount     int64 // 当前 WebSocket 连接数
 	streamCount int64 // 当前转发中的目标连接数
@@ -562,9 +563,7 @@ func forward(c io.ReadWriteCloser) {
 
 	done := make(chan struct{}, 2)
 	cp := func(dst, src io.ReadWriteCloser) {
-		bp := bufPool.Get().(*[]byte)
-		_, err := io.CopyBuffer(dst, src, *bp)
-		bufPool.Put(bp)
+		_, err := copyStream(dst, src)
 		if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
 			vlog("⚠️  转发结束: %v", err)
 		}
@@ -578,13 +577,24 @@ func forward(c io.ReadWriteCloser) {
 	<-done
 }
 
+// copyStream 单向拷贝：smux 流自带缓冲，直接 WriteTo，不占拷贝缓冲；
+// 其他方向用池里的 16KB 缓冲，并屏蔽 WriterTo/ReaderFrom，避免不同 Go 版本下内部再分配 32KB
+func copyStream(dst io.Writer, src io.Reader) (int64, error) {
+	if st, ok := src.(*smux.Stream); ok {
+		return st.WriteTo(dst)
+	}
+	bp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bp)
+	return io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{src}, *bp)
+}
+
 func smuxConfig() *smux.Config {
 	c := smux.DefaultConfig()
 	c.Version = 2
 	c.KeepAliveInterval = 10 * time.Second
 	c.KeepAliveTimeout = 30 * time.Second
-	c.MaxReceiveBuffer = 16 * 1024 * 1024
-	c.MaxStreamBuffer = 1024 * 1024
+	c.MaxReceiveBuffer = 4 * 1024 * 1024 // 每个会话的接收窗口：后端变慢时最多积压这么多
+	c.MaxStreamBuffer = 512 * 1024       // 单条流窗口：约 10MB/s@50ms RTT，够用且不至于一条流占满会话
 	return c
 }
 
@@ -594,7 +604,7 @@ func statsLoop() {
 		time.Sleep(60 * time.Second)
 		w, s := atomic.LoadInt64(&wsCount), atomic.LoadInt64(&streamCount)
 		if w != lw || s != ls {
-			log.Printf("📊 WebSocket 连接: %d，转发中: %d", w, s)
+			log.Printf("📊 WebSocket 连接: %d，转发中: %d，内存: %s", w, s, memUsage())
 			lw, ls = w, s
 		}
 	}
@@ -685,4 +695,11 @@ func writeFakePage(w http.ResponseWriter) {
 	w.Header().Set("Server", "nginx/1.18.0")
 	w.Header().Set("Connection", "close")
 	fmt.Fprint(w, honeypotHTML)
+}
+
+// memUsage Go 运行时向系统申请的内存（约等于进程常驻内存）和堆上正在使用的内存
+func memUsage() string {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return fmt.Sprintf("%dMB（堆 %dMB）", (m.Sys-m.HeapReleased)>>20, m.HeapInuse>>20)
 }

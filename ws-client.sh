@@ -14,7 +14,7 @@
 #                         bans | ban IP | unban IP | banlog | clearbans
 #================================================================
 
-SCRIPT_VER="v1.5.0"
+SCRIPT_VER="v1.6.0"
 REPO="acc66/ws-tunnel-pro"
 SCRIPT_NAME="ws-client.sh"
 SHORT_DEFAULT="wsc"
@@ -137,15 +137,23 @@ valid_servers() {
 }
 ports() { ls "$CONF_DIR"/*.conf 2>/dev/null | sed 's#.*/##; s#.conf$##' | grep -E '^[0-9]+$' | sort -n; }
 
+# Go 内存软上限（GOMEMLIMIT）：按物理内存的百分比计算，GC 在接近时收紧回收（不是硬限制，不会因此被杀）
+mem_limit() {
+    local kb; kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+    [ -n "$kb" ] && [ "$kb" -gt 0 ] && echo "$((kb * $1 / 100 / 1024))MiB" || echo "off"
+}
+
 write_unit() {
     cat > "$UNIT" <<EOF
 [Unit]
 Description=ws-tunnel client on port %i
-After=network-online.target
+After=network-online.target haproxy.service
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+# 每个端口一个进程，各自物理内存的 30%
+Environment=GOMEMLIMIT=$(mem_limit 30)
 EnvironmentFile=$CONF_DIR/%i.conf
 # 反探测拉黑配置（所有端口共用，文件不存在则关闭过滤）
 EnvironmentFile=-$FILTER_CONF

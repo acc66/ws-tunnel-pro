@@ -10,7 +10,7 @@
 #                         name 进程名      # 自定义进程名（- 恢复默认）
 #================================================================
 
-SCRIPT_VER="v1.5.0"
+SCRIPT_VER="v1.6.0"
 REPO="acc66/ws-tunnel-pro"
 SCRIPT_NAME="ws-tunnel.sh"
 SHORT_DEFAULT="wst"
@@ -122,7 +122,7 @@ update_script() {
 }
 
 load_conf() {
-    LISTEN=":8080"; TARGET=""; WSPATH="/mm"; PASSWORD=""; ALLOW=""; EXTRA=""
+    LISTEN=":8080"; TARGET=""; WSPATH="/mm"; PASSWORD=""; ALLOW=""; EXTRA=""; GOMEMLIMIT=""
     REDIS_HOST=""; REDIS_PORT="6379"; REDIS_PASS=""; NODE_ID="$(hostname)"
     [ -f "$CONF" ] && . "$CONF"
 }
@@ -142,19 +142,28 @@ REDIS_HOST="$REDIS_HOST"
 REDIS_PORT="$REDIS_PORT"
 REDIS_PASS="$REDIS_PASS"
 NODE_ID="$NODE_ID"
+# Go 内存软上限，留空 = 物理内存的 70%（如 1GiB、512MiB）
+${GOMEMLIMIT:+GOMEMLIMIT="$GOMEMLIMIT"}
 EOF
     chmod 600 "$CONF"
+}
+
+# Go 内存软上限（GOMEMLIMIT）：按物理内存的百分比计算，GC 在接近时收紧回收（不是硬限制，不会因此被杀）
+mem_limit() {
+    local kb; kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+    [ -n "$kb" ] && [ "$kb" -gt 0 ] && echo "$((kb * $1 / 100 / 1024))MiB" || echo "off"
 }
 
 write_unit() {
     cat > "$UNIT" <<EOF
 [Unit]
 Description=ws-tunnel WebSocket to TCP server with anti-probe blacklist
-After=network-online.target
+After=network-online.target haproxy.service
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+Environment=GOMEMLIMIT=$(mem_limit 70)
 EnvironmentFile=$CONF
 ExecStart=/bin/sh -c 'exec $BIN -listen "\$LISTEN" -target "\$TARGET" -path "\$WSPATH" -password "\$PASSWORD" -allow "\$ALLOW" -blacklist $BLFILE -redis-host "\$REDIS_HOST" -redis-port "\$REDIS_PORT" -redis-pass "\$REDIS_PASS" -node "\$NODE_ID" \$EXTRA'
 Restart=always
@@ -388,7 +397,7 @@ do_enable()  { systemctl enable "$SERVICE" && green "已开启开机启动"; }
 do_disable() { systemctl disable "$SERVICE" && green "已关闭开机启动"; }
 do_log()     { journalctl -u "$SERVICE" -n 100 -f --no-pager; }
 do_banlog()  { journalctl -u "$SERVICE" --no-pager | grep -E "拉黑|非法访问" | tail -50; }
-do_update()  { ensure_shortcut; update_script; download_bin; systemctl restart "$SERVICE"; green "当前程序版本: $(bin_ver)"; do_status; }
+do_update()  { ensure_shortcut; update_script; download_bin; write_unit; systemctl restart "$SERVICE"; green "当前程序版本: $(bin_ver)"; do_status; }
 
 do_uninstall() {
     read -rp "确认卸载 ws-tunnel？(y/N): " y; [ "$y" != "y" ] && return

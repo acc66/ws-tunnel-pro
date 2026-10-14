@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,7 +44,9 @@ var (
 	serverAddr = flag.String("server", "ws://2.2.2.2:8080/mm", "WebSocket 服务器地址，多个用逗号分隔（第一个为主，其余为备用）")
 	password   = flag.String("password", "your_secret_password", "连接密码")
 	useTLS     = flag.Bool("tls", false, "使用 WSS (TLS)")
-	muxConns   = flag.Int("mux", 4, "每个服务器复用的 WebSocket 连接数（0=关闭多路复用，每个连接单独一条 WebSocket）")
+	muxConns   = flag.Int("mux", 4, "每个服务器至少复用的 WebSocket 连接数（0=关闭多路复用，每个连接单独一条 WebSocket）")
+	muxStreams = flag.Int("mux-streams", 128, "每条复用 WebSocket 最多承载的连接数，超过自动新开（0=不限）")
+	muxMax     = flag.Int("mux-max", 64, "每个服务器最多的复用 WebSocket 数")
 	dialTO     = flag.Duration("timeout", 5*time.Second, "连接服务器超时（超时即切换备用服务器）")
 	checkEvery = flag.Duration("check", 10*time.Second, "故障服务器的探测间隔（恢复后自动切回）")
 	verbose    = flag.Bool("v", false, "输出每个连接的日志（连接数大时建议关闭）")
@@ -70,7 +73,7 @@ const (
 )
 
 var (
-	bufPool  = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
+	bufPool  = sync.Pool{New: func() any { b := make([]byte, 16*1024); return &b }} // 只给 TCP→隧道 方向用
 	wbufPool = &sync.Pool{}
 
 	activeConns int64
@@ -154,19 +157,24 @@ func (u *upstream) open() (io.ReadWriteCloser, error) {
 		}
 		return newWSConn(ws), nil
 	}
-	sess, err := u.session()
-	if err != nil {
-		return nil, err
-	}
-	if sess == nil { // 服务端不支持多路复用，已退回单连接模式
-		return u.open()
-	}
-	st, err := sess.OpenStream()
-	if err != nil {
+	// 会话可能刚好被回收或断开，换一个会话重试，避免误判服务器故障
+	var lastErr error
+	for try := 0; try < 3; try++ {
+		sess, err := u.session()
+		if err != nil {
+			return nil, err
+		}
+		if sess == nil { // 服务端不支持多路复用，已退回单连接模式
+			return u.open()
+		}
+		st, err := sess.OpenStream()
+		if err == nil {
+			return st, nil
+		}
 		sess.Close()
-		return nil, err
+		lastErr = err
 	}
-	return st, nil
+	return nil, lastErr
 }
 
 // muxSlot 一条复用 WebSocket。同一槽位同时只拨号一次，其他请求等待结果（防止瞬间大量连接时一起拨号）
@@ -176,32 +184,52 @@ type muxSlot struct {
 	err     error         // 最近一次拨号的错误
 }
 
-// session 轮询取一个可用的 smux 会话，槽位为空或已断开则新建
+// session 取一个可用的 smux 会话：
+// 已连好且未满（流数 < -mux-streams）的会话中挑流数最少的；
+// 都满了就新开一个槽位（最多 -mux-max 个）；空闲多出来的会话由 trimSlots 回收
 func (u *upstream) session() (*smux.Session, error) {
 	u.mu.Lock()
-	if len(u.slots) != *muxConns {
-		u.slots = make([]*muxSlot, *muxConns)
-		for i := range u.slots {
-			u.slots[i] = &muxSlot{}
+	if len(u.slots) < *muxConns {
+		for len(u.slots) < *muxConns {
+			u.slots = append(u.slots, &muxSlot{})
 		}
 	}
-	// 优先挑已连好的槽位，避免某个槽位断开时新连接都卡在它的重连上
+	// 优先挑已连好且流数最少的槽位，避免某个槽位断开时新连接都卡在它的重连上
+	var best *smux.Session
+	for k := 0; k < len(u.slots); k++ {
+		s := u.slots[(u.next+k)%len(u.slots)]
+		if s.sess == nil || s.sess.IsClosed() {
+			continue
+		}
+		if best == nil || s.sess.NumStreams() < best.NumStreams() {
+			best = s.sess
+		}
+	}
+	if best != nil && (*muxStreams <= 0 || best.NumStreams() < *muxStreams) {
+		u.next++
+		u.mu.Unlock()
+		return best, nil
+	}
+	// 没有可用会话：先找空槽位（未连或已断开）；都在用且都满了就扩容
 	var sl *muxSlot
 	for k := 0; k < len(u.slots); k++ {
 		s := u.slots[(u.next+k)%len(u.slots)]
-		if s.sess != nil && !s.sess.IsClosed() {
+		if s.sess == nil || s.sess.IsClosed() {
 			sl = s
 			u.next += k + 1
 			break
 		}
 	}
-	if sl != nil {
-		sess := sl.sess
-		u.mu.Unlock()
-		return sess, nil
+	if sl == nil {
+		if len(u.slots) >= *muxMax {
+			// 已达上限：在最少的会话上继续开流
+			u.mu.Unlock()
+			return best, nil
+		}
+		sl = &muxSlot{}
+		u.slots = append(u.slots, sl)
+		vlog("📈 %s 复用连接扩容到 %d 条", u.url, len(u.slots))
 	}
-	sl = u.slots[u.next%len(u.slots)]
-	u.next++
 	if ch := sl.dialing; ch != nil {
 		u.mu.Unlock()
 		<-ch
@@ -265,13 +293,24 @@ func (u *upstream) probe() {
 	u.setDown(false, nil)
 }
 
+// copyStream 单向拷贝：smux 流自带缓冲，直接 WriteTo，不占拷贝缓冲；
+// 其他方向用池里的 16KB 缓冲，并屏蔽 WriterTo/ReaderFrom，避免不同 Go 版本下内部再分配 32KB
+func copyStream(dst io.Writer, src io.Reader) (int64, error) {
+	if st, ok := src.(*smux.Stream); ok {
+		return st.WriteTo(dst)
+	}
+	bp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bp)
+	return io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{src}, *bp)
+}
+
 func smuxConfig() *smux.Config {
 	c := smux.DefaultConfig()
 	c.Version = 2
 	c.KeepAliveInterval = 10 * time.Second
 	c.KeepAliveTimeout = 30 * time.Second
-	c.MaxReceiveBuffer = 16 * 1024 * 1024
-	c.MaxStreamBuffer = 1024 * 1024
+	c.MaxReceiveBuffer = 4 * 1024 * 1024 // 每个会话的接收窗口：后端变慢时最多积压这么多
+	c.MaxStreamBuffer = 512 * 1024       // 单条流窗口：约 10MB/s@50ms RTT，够用且不至于一条流占满会话
 	return c
 }
 
@@ -305,7 +344,41 @@ func checkLoop() {
 			if u.isDown() {
 				go u.probe()
 			}
+			u.trimSlots()
 		}
+	}
+}
+
+// trimSlots 扩容出来的槽位（超过 -mux 的部分）空闲（无流）就关闭回收，已断开的直接移除
+func (u *upstream) trimSlots() {
+	u.mu.Lock()
+	var closing []*smux.Session
+	keep := u.slots[:0]
+	for i, s := range u.slots {
+		extra := i >= *muxConns
+		switch {
+		case !extra || s.dialing != nil:
+			keep = append(keep, s)
+		case s.sess == nil || s.sess.IsClosed():
+			// 已断开的扩容槽位直接丢弃
+		case s.sess.NumStreams() == 0:
+			closing = append(closing, s.sess)
+		default:
+			keep = append(keep, s)
+		}
+	}
+	for i := len(keep); i < len(u.slots); i++ {
+		u.slots[i] = nil
+	}
+	shrunk := len(keep) != len(u.slots)
+	u.slots = keep
+	n := len(keep)
+	u.mu.Unlock()
+	for _, s := range closing {
+		s.Close()
+	}
+	if shrunk {
+		vlog("📉 %s 复用连接回收到 %d 条", u.url, n)
 	}
 }
 
@@ -414,8 +487,15 @@ func main() {
 		}
 		log.Printf("🌐 %s服务器: %s", role, u.url)
 	}
+	if *muxMax < *muxConns {
+		*muxMax = *muxConns
+	}
 	if *muxConns > 0 {
-		log.Printf("🔀 多路复用: 每个服务器 %d 条 WebSocket", *muxConns)
+		if *muxStreams > 0 {
+			log.Printf("🔀 多路复用: 每个服务器 %d～%d 条 WebSocket，每条最多 %d 个连接", *muxConns, *muxMax, *muxStreams)
+		} else {
+			log.Printf("🔀 多路复用: 每个服务器 %d 条 WebSocket", *muxConns)
+		}
 	} else {
 		log.Printf("🔀 多路复用: 关闭")
 	}
@@ -480,7 +560,7 @@ func statsLoop() {
 	for {
 		time.Sleep(60 * time.Second)
 		if n := atomic.LoadInt64(&activeConns); n != last {
-			log.Printf("📊 当前活动连接: %d", n)
+			log.Printf("📊 当前活动连接: %d，内存: %s", n, memUsage())
 			last = n
 		}
 	}
@@ -528,9 +608,7 @@ func handleConnection(localConn net.Conn) {
 func pipe(a, b io.ReadWriteCloser) {
 	done := make(chan struct{}, 2)
 	cp := func(dst, src io.ReadWriteCloser) {
-		bp := bufPool.Get().(*[]byte)
-		io.CopyBuffer(dst, src, *bp)
-		bufPool.Put(bp)
+		copyStream(dst, src)
 		dst.Close()
 		src.Close()
 		done <- struct{}{}
@@ -958,4 +1036,11 @@ func filterRequest(c net.Conn) (head []byte, src io.ReadWriteCloser, ok bool) {
 		return nil, nil, false
 	}
 	return head, &bufConn{Conn: c, r: r}, true
+}
+
+// memUsage Go 运行时向系统申请的内存（约等于进程常驻内存）和堆上正在使用的内存
+func memUsage() string {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return fmt.Sprintf("%dMB（堆 %dMB）", (m.Sys-m.HeapReleased)>>20, m.HeapInuse>>20)
 }
