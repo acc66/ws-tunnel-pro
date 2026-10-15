@@ -127,23 +127,31 @@ load_conf() {
     [ -f "$CONF" ] && . "$CONF"
 }
 
+# 配置值用单引号写入：bash 的 . 和 systemd 的 EnvironmentFile 都按字面读取，$ ` " \ 不会被展开或吞掉
+# 单引号本身无法在单引号里表示，所以配置值不允许包含 '
+has_squote() { [[ "$1" == *"'"* ]]; }
+
 save_conf() {
+    local k
+    for k in LISTEN TARGET WSPATH PASSWORD ALLOW EXTRA REDIS_HOST REDIS_PORT REDIS_PASS NODE_ID GOMEMLIMIT; do
+        has_squote "${!k}" && { red "$k 不能包含单引号 '，配置未保存"; return 1; }
+    done
     mkdir -p "$CONF_DIR"
     cat > "$CONF" <<EOF
 # 修改后执行: bash ws-tunnel.sh restart
-LISTEN="$LISTEN"
-TARGET="$TARGET"
-WSPATH="$WSPATH"
-PASSWORD="$PASSWORD"
-ALLOW="$ALLOW"
-EXTRA="$EXTRA"
+LISTEN='$LISTEN'
+TARGET='$TARGET'
+WSPATH='$WSPATH'
+PASSWORD='$PASSWORD'
+ALLOW='$ALLOW'
+EXTRA='$EXTRA'
 # 共享 Redis（可选，REDIS_HOST 留空则只用本地拉黑文件 $BLFILE）
-REDIS_HOST="$REDIS_HOST"
-REDIS_PORT="$REDIS_PORT"
-REDIS_PASS="$REDIS_PASS"
-NODE_ID="$NODE_ID"
+REDIS_HOST='$REDIS_HOST'
+REDIS_PORT='$REDIS_PORT'
+REDIS_PASS='$REDIS_PASS'
+NODE_ID='$NODE_ID'
 # Go 内存软上限，留空 = 物理内存的 70%（如 1GiB、512MiB）
-${GOMEMLIMIT:+GOMEMLIMIT="$GOMEMLIMIT"}
+${GOMEMLIMIT:+GOMEMLIMIT='$GOMEMLIMIT'}
 EOF
     chmod 600 "$CONF"
 }
@@ -249,7 +257,7 @@ do_redis() {
         2) REDIS_HOST="" ;;
         *) return ;;
     esac
-    save_conf; systemctl restart "$SERVICE"; green "Redis: ${REDIS_HOST:-已关闭}"
+    save_conf || return 1; systemctl restart "$SERVICE"; green "Redis: ${REDIS_HOST:-已关闭}"
 }
 
 do_install() {
@@ -273,7 +281,7 @@ do_install() {
 
     do_name
     download_bin
-    save_conf
+    save_conf || exit 1
     write_unit
     systemctl enable "$SERVICE" >/dev/null 2>&1
     systemctl restart "$SERVICE"
@@ -302,7 +310,7 @@ do_addport() {
         red "端口 $p 已被其他程序占用"; return 1
     fi
     LISTEN="${LISTEN:+$LISTEN,}:$p"
-    save_conf; systemctl restart "$SERVICE"
+    save_conf || return 1; systemctl restart "$SERVICE"
     green "已添加端口 $p，当前: ${LISTEN//:/}"
     open_firewall "$p"
 }
@@ -314,7 +322,7 @@ do_delport() {
     local new=""
     for x in ${LISTEN//,/ }; do [ "$x" != ":$p" ] && new="${new:+$new,}$x"; done
     [ -z "$new" ] && { red "至少保留一个端口"; return 1; }
-    LISTEN="$new"; save_conf; systemctl restart "$SERVICE"
+    LISTEN="$new"; save_conf || return 1; systemctl restart "$SERVICE"
     green "已删除端口 $p，当前: ${LISTEN//:/}"
 }
 
@@ -322,24 +330,25 @@ do_target() {
     load_conf
     local t="$1"; [ -z "$t" ] && read -rp "新的目标地址（多个用逗号分隔，按顺序故障切换）: " t
     [ -z "$t" ] && return 1
-    TARGET="$t"; save_conf; systemctl restart "$SERVICE"; green "已改为转发到 $TARGET"
+    TARGET="$t"; save_conf || return 1; systemctl restart "$SERVICE"; green "已改为转发到 $TARGET"
 }
 
 do_passwd() {
     load_conf
     local p="$1"; [ -z "$p" ] && read -rp "新密码: " p
     [ -z "$p" ] && return 1
-    PASSWORD="$p"; save_conf; systemctl restart "$SERVICE"; green "密码已修改，客户端需同步修改"
+    PASSWORD="$p"; save_conf || return 1; systemctl restart "$SERVICE"; green "密码已修改，客户端需同步修改"
 }
 
 do_allow() {
     load_conf
     local a="$1"; [ -z "$a" ] && read -rp "白名单IP(逗号分隔，输入 - 清空) [$ALLOW]: " a
     [ "$a" = "-" ] && a=""
-    ALLOW="$a"; save_conf; systemctl restart "$SERVICE"; green "白名单: ${ALLOW:-无}"
+    ALLOW="$a"; save_conf || return 1; systemctl restart "$SERVICE"; green "白名单: ${ALLOW:-无}"
 }
 
-bl_count() { [ -f "$BLFILE" ] && grep -cvE '^[[:space:]]*(#|$)' "$BLFILE" || echo 0; }
+# grep -c 无匹配时会输出 0 并返回 1，不能再用 || echo 0（会输出两行 0）
+bl_count() { local c; c=$(grep -cvE '^[[:space:]]*(#|$)' "$BLFILE" 2>/dev/null); echo "${c:-0}"; }
 
 valid_ip() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$1" =~ ^[0-9a-fA-F:]+$ ]]; }
 
