@@ -14,7 +14,7 @@
 #                         bans | ban IP | unban IP | banlog | clearbans
 #================================================================
 
-SCRIPT_VER="v1.6.2"
+SCRIPT_VER="v1.6.3"
 REPO="acc66/ws-tunnel-pro"
 SCRIPT_NAME="ws-client.sh"
 SHORT_DEFAULT="wsc"
