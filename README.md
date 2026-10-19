@@ -286,6 +286,8 @@ wst install               # 安装 / 重新配置
 wst ports                 # 查看配置
 wst addport 8443 | delport 8443
 wst target unix:/run/haproxy-ws.sock,127.0.0.1:20001
+wst addroute 8181 127.0.0.1:7789   # 8181 单独转发到 7789（不走 target），同路径同密码
+wst delroute 8181
 wst passwd 新密码         # A 要同步修改
 wst allow A_IP,你的IP
 wst log | banlog | bans

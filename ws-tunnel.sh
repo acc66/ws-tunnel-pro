@@ -4,13 +4,14 @@
 # 用法: bash ws-tunnel.sh            # 交互菜单
 #       bash ws-tunnel.sh install | addport 端口 | delport 端口 | ports
 #                         target ip:port | passwd 新密码 | log | banlog
+#                         addroute 端口 目标 | delroute 端口   # 端口单独转发到别的目标
 #                         bans | unban IP | ban IP | clearbans | allow IP列表 | redis
 #                         restart | stop | status | enable | disable | update | uninstall | version
 #                         shortcut [名字]   # 快捷命令，默认 wst
 #                         name 进程名      # 自定义进程名（- 恢复默认）
 #================================================================
 
-SCRIPT_VER="v1.6.3"
+SCRIPT_VER="v1.7.0"
 REPO="acc66/ws-tunnel-pro"
 SCRIPT_NAME="ws-tunnel.sh"
 SHORT_DEFAULT="wst"
@@ -122,7 +123,7 @@ update_script() {
 }
 
 load_conf() {
-    LISTEN=":8080"; TARGET=""; WSPATH="/mm"; PASSWORD=""; ALLOW=""; EXTRA=""; GOMEMLIMIT=""
+    LISTEN=":8080"; TARGET=""; ROUTES=""; WSPATH="/mm"; PASSWORD=""; ALLOW=""; EXTRA=""; GOMEMLIMIT=""
     REDIS_HOST=""; REDIS_PORT="6379"; REDIS_PASS=""; NODE_ID="$(hostname)"
     [ -f "$CONF" ] && . "$CONF"
 }
@@ -133,7 +134,7 @@ has_squote() { [[ "$1" == *"'"* ]]; }
 
 save_conf() {
     local k
-    for k in LISTEN TARGET WSPATH PASSWORD ALLOW EXTRA REDIS_HOST REDIS_PORT REDIS_PASS NODE_ID GOMEMLIMIT; do
+    for k in LISTEN TARGET ROUTES WSPATH PASSWORD ALLOW EXTRA REDIS_HOST REDIS_PORT REDIS_PASS NODE_ID GOMEMLIMIT; do
         has_squote "${!k}" && { red "$k 不能包含单引号 '，配置未保存"; return 1; }
     done
     mkdir -p "$CONF_DIR"
@@ -141,6 +142,8 @@ save_conf() {
 # 修改后执行: bash ws-tunnel.sh restart
 LISTEN='$LISTEN'
 TARGET='$TARGET'
+# 端口单独转发（不走 TARGET），格式 :端口=目标，多组用分号分隔，如 :8181=127.0.0.1:7789
+ROUTES='$ROUTES'
 WSPATH='$WSPATH'
 PASSWORD='$PASSWORD'
 ALLOW='$ALLOW'
@@ -173,6 +176,9 @@ pw_args() {
 
 write_unit() {
     pw_args
+    # 支持 -route 的程序（含 ws-route-v1）才传，避免旧程序因未知参数启动失败
+    local RT_ARG=''
+    grep -q "ws-route-v1" "$BIN" 2>/dev/null && RT_ARG='-route "$ROUTES" '
     cat > "$UNIT" <<EOF
 [Unit]
 Description=ws-tunnel WebSocket to TCP server with anti-probe blacklist
@@ -183,7 +189,7 @@ StartLimitIntervalSec=0
 [Service]
 Environment=GOMEMLIMIT=$(mem_limit 70)
 EnvironmentFile=$CONF
-ExecStart=/bin/sh -c '${PW_PRE}exec $BIN ${PW_ARG}-listen "\$LISTEN" -target "\$TARGET" -path "\$WSPATH" -allow "\$ALLOW" -blacklist $BLFILE -redis-host "\$REDIS_HOST" -redis-port "\$REDIS_PORT" -node "\$NODE_ID" \$EXTRA'
+ExecStart=/bin/sh -c '${PW_PRE}exec $BIN ${PW_ARG}-listen "\$LISTEN" -target "\$TARGET" ${RT_ARG}-path "\$WSPATH" -allow "\$ALLOW" -blacklist $BLFILE -redis-host "\$REDIS_HOST" -redis-port "\$REDIS_PORT" -node "\$NODE_ID" \$EXTRA'
 Restart=always
 RestartSec=3
 LimitNOFILE=1000000
@@ -296,6 +302,7 @@ do_ports() {
     echo "监听端口: ${LISTEN//:/}"
     echo "WS 路径:  $WSPATH"
     echo "转发到:   $TARGET"
+    local r x; for r in ${ROUTES//;/ }; do x="${r%%=*}"; echo "单独转发: ${x##*:} → ${r#*=}"; done
     echo "拉黑文件: $BLFILE（$(bl_count) 个IP）   共享Redis: ${REDIS_HOST:-未启用}"
     echo "进程名:   $SERVICE（$BIN）"
     echo "开机启动: $(systemctl is-enabled "$SERVICE" 2>/dev/null || echo 未安装)   运行状态: $(systemctl is-active "$SERVICE" 2>/dev/null)"
@@ -306,6 +313,7 @@ do_addport() {
     local p="$1"; [ -z "$p" ] && read -rp "要添加的端口: " p
     valid_port "$p" || { red "端口无效"; return 1; }
     [[ ",$LISTEN," == *",:$p,"* ]] && { yellow "端口 $p 已存在"; return 0; }
+    [[ "$(route_ports)" == *",$p,"* ]] && { red "端口 $p 已有单独转发，先 delroute $p"; return 1; }
     if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p\$"; then
         red "端口 $p 已被其他程序占用"; return 1
     fi
@@ -331,6 +339,40 @@ do_target() {
     local t="$1"; [ -z "$t" ] && read -rp "新的目标地址（多个用逗号分隔，按顺序故障切换）: " t
     [ -z "$t" ] && return 1
     TARGET="$t"; save_conf || return 1; systemctl restart "$SERVICE"; green "已改为转发到 $TARGET"
+}
+
+# ROUTES 里的端口列表（逗号分隔，用于查重）
+route_ports() { local r o=""; for r in ${ROUTES//;/ }; do r="${r%%=*}"; o="$o,${r##*:}"; done; echo "$o,"; }
+
+# 端口单独转发: 该端口的 WebSocket 连接转发到指定目标，而不是 TARGET
+do_addroute() {
+    load_conf
+    local p="$1" t="$2"
+    [ -z "$p" ] && read -rp "单独转发的端口: " p
+    valid_port "$p" || { red "端口无效"; return 1; }
+    [[ ",$LISTEN," == *",:$p,"* ]] && { red "端口 $p 已是主监听端口（转发到 TARGET），先 delport $p"; return 1; }
+    [[ "$(route_ports)" == *",$p,"* ]] && { red "端口 $p 已有单独转发，先 delroute $p"; return 1; }
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p\$"; then
+        red "端口 $p 已被其他程序占用"; return 1
+    fi
+    [ -z "$t" ] && read -rp "转发到（ip:port 或 unix:/路径，多个用逗号分隔按顺序故障切换）: " t
+    [ -z "$t" ] && { red "必须填写目标地址"; return 1; }
+    [[ "$t" == *[\;=[:space:]]* ]] && { red "目标地址不能包含 ; = 或空格"; return 1; }
+    [ -x "$BIN" ] && ! grep -q "ws-route-v1" "$BIN" && { red "程序版本过旧不支持单独转发，先执行 $(CMD) update"; return 1; }
+    ROUTES="${ROUTES:+$ROUTES;}:$p=$t"
+    save_conf || return 1; write_unit; systemctl restart "$SERVICE"
+    green "已添加: $p → $t"
+    open_firewall "$p"
+}
+
+do_delroute() {
+    load_conf
+    local p="$1"; [ -z "$p" ] && read -rp "要删除单独转发的端口: " p
+    [[ "$(route_ports)" != *",$p,"* ]] && { yellow "端口 $p 没有单独转发"; return 1; }
+    local r new=""
+    for r in ${ROUTES//;/ }; do [ "${r%%=*}" != ":$p" ] && new="${new:+$new;}$r"; done
+    ROUTES="$new"; save_conf || return 1; write_unit; systemctl restart "$SERVICE"
+    green "已删除端口 $p 的单独转发"
 }
 
 do_passwd() {
@@ -472,6 +514,7 @@ menu() {
         echo "19. 更新程序            20. 卸载"
         echo "21. 查看版本            22. 设置快捷命令（当前: $(short_name)）"
         echo "23. 修改进程名（当前: $SERVICE）"
+        echo "24. 添加端口单独转发    25. 删除端口单独转发"
         echo " 0. 退出"
         read -rp "选择: " n
         case "$n" in
@@ -480,6 +523,7 @@ menu() {
             9) do_bans ;; 10) do_unban ;; 11) do_ban ;; 12) do_clearbans ;;
             13) do_redis ;; 14) do_restart ;; 15) do_stop ;; 16) do_status ;;
             17) do_enable ;; 18) do_disable ;; 19) do_update ;; 20) do_uninstall ;; 21) do_version ;; 22) set_shortcut ;; 23) do_name ;;
+            24) do_addroute ;; 25) do_delroute ;;
             0) exit 0 ;;
         esac
     done
@@ -493,5 +537,6 @@ case "$1" in
     restart) do_restart ;; stop) do_stop ;; status) do_status ;;
     enable) do_enable ;; disable) do_disable ;;
     update) do_update ;; uninstall) do_uninstall ;; version|-v|--version) do_version ;; shortcut) set_shortcut "$2" ;; name) do_name "$2" ;;
+    addroute) do_addroute "$2" "$3" ;; delroute) do_delroute "$2" ;;
     *) ensure_shortcut; menu ;;
 esac

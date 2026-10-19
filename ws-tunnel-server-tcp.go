@@ -40,6 +40,7 @@ var (
 	wsPath     = flag.String("path", "/mm", "WebSocket 路径")
 	targetAddr = flag.String("target", "xjpk1.help600.com:2086", "目标地址 ip:port 或 unix:/路径，多个用逗号分隔（按顺序故障切换，如 unix:/run/haproxy-ws.sock,127.0.0.1:20001）")
 	password   = flag.String("password", "your_secret_password", "连接密码（也可用环境变量 WS_PASSWORD，ws-env-password-v1）")
+	routeAddr  = flag.String("route", "", "额外端口单独转发，多组用分号分隔，如 :8181=127.0.0.1:7789;:8282=unix:/run/a.sock,127.0.0.1:20002（ws-route-v1）")
 
 	blFile    = flag.String("blacklist", "/etc/ws-tunnel/blacklist.txt", "本地拉黑文件（每行一个IP）")
 	redisHost = flag.String("redis-host", "", "共享 Redis 地址（留空则只用本地拉黑文件）")
@@ -457,18 +458,38 @@ func main() {
 		}
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc(*wsPath, handleWebSocketTunnel)
-	mux.HandleFunc("/", handleFakePage)
-
 	log.Printf("🚀 WebSocket TCP 隧道服务器启动 %s", version)
 	log.Printf("🔑 WebSocket 路径: %s", *wsPath)
-	targets = parseTargets(*targetAddr)
-	if len(targets) == 0 {
+	defGroup := newTargetGroup(*targetAddr)
+	if defGroup == nil {
 		log.Fatal("未配置目标地址 -target")
 	}
-	log.Printf("🎯 目标地址: %s", *targetAddr)
-	go dialFailLoop()
+	go defGroup.dialFailLoop()
+
+	// -route ":8181=127.0.0.1:7789;:8282=..."：端口单独转发，各自独立故障切换
+	type listenGroup struct {
+		addr string
+		g    *targetGroup
+	}
+	var listens []listenGroup
+	for _, a := range strings.Split(*listenAddr, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			listens = append(listens, listenGroup{a, defGroup})
+		}
+	}
+	for _, rt := range strings.Split(*routeAddr, ";") {
+		if rt = strings.TrimSpace(rt); rt == "" {
+			continue
+		}
+		a, t, _ := strings.Cut(rt, "=")
+		a = strings.TrimSpace(a)
+		g := newTargetGroup(t)
+		if a == "" || g == nil {
+			log.Fatalf("-route 格式错误: %q（应为 :端口=目标）", rt)
+		}
+		go g.dialFailLoop()
+		listens = append(listens, listenGroup{a, g})
+	}
 	switch {
 	case *noBan:
 		log.Printf("🛡️  拉黑已关闭")
@@ -481,23 +502,24 @@ func main() {
 	go statsLoop()
 
 	errCh := make(chan error, 1)
-	for _, a := range strings.Split(*listenAddr, ",") {
-		a = strings.TrimSpace(a)
-		if a == "" {
-			continue
-		}
-		ln, err := net.Listen("tcp", a)
+	for _, l := range listens {
+		ln, err := net.Listen("tcp", l.addr)
 		if err != nil {
-			log.Fatalf("监听 %s 失败: %v", a, err)
+			log.Fatalf("监听 %s 失败: %v", l.addr, err)
 		}
-		log.Printf("📍 监听地址: %s", a)
+		log.Printf("📍 监听地址: %s → %s", l.addr, l.g.raw)
+		// 每个监听端口单独一个 mux，隧道处理绑定该端口的目标组
+		g := l.g
+		mux := http.NewServeMux()
+		mux.HandleFunc(*wsPath, func(w http.ResponseWriter, r *http.Request) { handleWebSocketTunnel(w, r, g) })
+		mux.HandleFunc("/", handleFakePage)
 		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 		go func() { errCh <- srv.Serve(filterListener{ln}) }()
 	}
 	log.Fatal("启动失败:", <-errCh)
 }
 
-func handleWebSocketTunnel(w http.ResponseWriter, r *http.Request) {
+func handleWebSocketTunnel(w http.ResponseWriter, r *http.Request, g *targetGroup) {
 	// 路径必须精确匹配（ServeMux 对 "/mm/" 这类前缀也会命中）
 	if r.URL.Path != *wsPath {
 		handleFakePage(w, r)
@@ -537,8 +559,8 @@ func handleWebSocketTunnel(w http.ResponseWriter, r *http.Request) {
 	defer atomic.AddInt64(&wsCount, -1)
 
 	if !useMux {
-		vlog("✅ 新连接: %s → %s", r.RemoteAddr, *targetAddr)
-		forward(conn)
+		vlog("✅ 新连接: %s → %s", r.RemoteAddr, g.raw)
+		g.forward(conn)
 		vlog("🔌 连接关闭: %s", r.RemoteAddr)
 		return
 	}
@@ -557,7 +579,7 @@ func handleWebSocketTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 		go func() {
 			defer st.Close()
-			forward(st)
+			g.forward(st)
 		}()
 	}
 	vlog("🔌 复用连接关闭: %s", r.RemoteAddr)
@@ -573,7 +595,21 @@ type target struct {
 
 const targetRetry = 5 * time.Second
 
-var targets []*target
+// targetGroup 一组按顺序故障切换的目标：-target 是默认组，-route 每个端口一组
+type targetGroup struct {
+	raw         string
+	targets     []*target
+	dialFails   atomic.Int64 // 连接目标失败的计数，每 10 秒汇总输出一次，避免故障时每个连接刷一行日志
+	dialLastErr atomic.Value
+}
+
+func newTargetGroup(s string) *targetGroup {
+	ts := parseTargets(s)
+	if len(ts) == 0 {
+		return nil
+	}
+	return &targetGroup{raw: strings.TrimSpace(s), targets: ts}
+}
 
 func parseTargets(s string) []*target {
 	var out []*target
@@ -600,7 +636,8 @@ func (t *target) dial() (net.Conn, error) {
 
 // dialTarget 按顺序连接目标：unix:/path 走 Unix socket（绕开本机回环 TCP 协议栈），否则 TCP。
 // 失败的目标标记为故障，targetRetry 内直接用下一个；全部故障时仍逐个硬试
-func dialTarget() (net.Conn, error) {
+func (g *targetGroup) dialTarget() (net.Conn, error) {
+	targets := g.targets
 	var lastErr error
 	now := time.Now().UnixNano()
 	for pass := 0; pass < 2; pass++ {
@@ -629,30 +666,24 @@ func dialTarget() (net.Conn, error) {
 	return nil, lastErr
 }
 
-// dialFails 连接目标失败的计数，每 10 秒汇总输出一次，避免故障时每个连接刷一行日志
-var (
-	dialFails   atomic.Int64
-	dialLastErr atomic.Value
-)
-
-func dialFailLoop() {
+func (g *targetGroup) dialFailLoop() {
 	for {
 		time.Sleep(10 * time.Second)
-		if n := dialFails.Swap(0); n > 0 {
-			log.Printf("❌ 10 秒内连接目标失败 %d 次（%s）: %v", n, *targetAddr, dialLastErr.Load())
+		if n := g.dialFails.Swap(0); n > 0 {
+			log.Printf("❌ 10 秒内连接目标失败 %d 次（%s）: %v", n, g.raw, g.dialLastErr.Load())
 		}
 	}
 }
 
 // forward 连接目标并双向转发，任意一端结束即关闭两端
-func forward(c io.ReadWriteCloser) {
+func (g *targetGroup) forward(c io.ReadWriteCloser) {
 	atomic.AddInt64(&streamCount, 1)
 	defer atomic.AddInt64(&streamCount, -1)
 
-	tcpConn, err := dialTarget()
+	tcpConn, err := g.dialTarget()
 	if err != nil {
-		dialFails.Add(1)
-		dialLastErr.Store(err.Error())
+		g.dialFails.Add(1)
+		g.dialLastErr.Store(err.Error())
 		return
 	}
 	if tc, ok := tcpConn.(*net.TCPConn); ok {
