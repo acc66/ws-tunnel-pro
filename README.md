@@ -134,6 +134,24 @@ bash ws-tunnel.sh install
 
 装完服务已启动并开机自启，快捷命令是 `wst`。云服务器记得在安全组放行 TCP 8080。
 
+### 端口单独转发（v1.7.0+）
+
+`addport` 加的端口都转发到同一个目标地址。某个端口要转发到别的服务时用 `addroute`：
+
+```bash
+wst addroute 8181 127.0.0.1:7789                        # 8181 → 7789
+wst addroute 8282 unix:/run/b.sock,127.0.0.1:20002      # 也支持多个地址故障切换
+wst ports                                               # 查看，会多出「单独转发: 8181 → 127.0.0.1:7789」
+wst delroute 8181                                       # 删除
+```
+
+也可以在菜单里选 24 添加、25 删除。
+
+- 同一个程序、同一个服务，WebSocket 路径、密码、白名单、拉黑规则都和主端口共用，A 端照常 `wsc add 端口 ws://B_IP:8181/mm 你的密码`。
+- 每个端口只能二选一：是主端口（`addport`）就不能再 `addroute`，反过来也一样。
+- 配置写在 `/etc/ws-tunnel/ws-tunnel.conf` 的 `ROUTES`，格式 `:8181=127.0.0.1:7789;:8282=...`；手动改完要 `wst update`（重写服务）而不是只 `restart`，从旧版升级时服务文件里还没有 `-route` 参数。
+- 旧版程序不支持，先 `wst update`。安全组记得放行新端口。
+
 ## 4. A 服务器：安装 ws-client
 
 ```bash
@@ -320,7 +338,7 @@ wsc uninstall
 | 服务器 | 路径 | 内容 |
 |---|---|---|
 | B | `/usr/local/bin/<进程名>` | 程序 |
-| B | `/etc/ws-tunnel/ws-tunnel.conf` | 配置（端口、密码、目标、白名单、Redis、GOMEMLIMIT） |
+| B | `/etc/ws-tunnel/ws-tunnel.conf` | 配置（端口、密码、目标、单独转发 ROUTES、白名单、Redis、GOMEMLIMIT） |
 | B | `/etc/ws-tunnel/blacklist.txt` | 拉黑文件 |
 | B | `/etc/systemd/system/<进程名>.service` | 系统服务 |
 | A | `/usr/local/bin/<进程名>` | 程序 |
